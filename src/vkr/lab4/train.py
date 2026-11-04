@@ -15,7 +15,7 @@ from torch import nn
 from .labels import LABEL2ID, N_CLASSES
 from .metrics import ece, macro_f1
 from .models import n_trainable
-from .mutations import build_set, markov_frames
+from .mutations import build_set, markov_frames, scenario_test_sets
 from .optimizers import make_optimizer
 from .spec import RunSpec
 
@@ -27,12 +27,7 @@ class Context:
         self.cfg, self.splits, self.backend, self.device = cfg, splits, backend, device
         t, mc, sc = cfg.protocol["train"], cfg.mutations, cfg.scenarios
         self.val = build_set(splits["val"], sc["val_mutations"], "val", mc, mc["seeds"]["val"], t["copies_val"], keep_original=True)
-        self.test_sets: dict[str, pd.DataFrame] = {}
-        for name, s in sc["scenarios"].items():
-            if "mutations" in s:
-                copies = 1 if name == "S0" else t["copies_test"]
-                self.test_sets[name] = build_set(splits["test"], s["mutations"], "test", mc, mc["seeds"]["test"], copies,
-                                                 keep_original=(name == "S0"))
+        self.test_sets: dict[str, pd.DataFrame] = scenario_test_sets(sc, mc, t["copies_test"], splits["test"])
         self.markov = list(markov_frames(splits["test"], sc["scenarios"]["S5"], mc, mc["seeds"]["test"])) \
             if "S5" in sc["scenarios"] else []
 
@@ -80,7 +75,9 @@ def _sync(device: str):
 
 
 def train_run(spec: RunSpec, ctx: Context, log_dir: Path | None = None, eval_scenarios: bool = True,
-              save_probs_dir: Path | None = None) -> dict:
+              save_probs_dir: Path | None = None, step_hook=None) -> dict:
+    """step_hook(done_steps, model) -> bool вызывается после каждого шага; True останавливает обучение (используется для
+    замера шума градиента на чекпоинте). Время хука не входит в train_time_s. Без хука поведение прежнее."""
     cfg, backend, device = ctx.cfg, ctx.backend, ctx.device
     tcfg = cfg.protocol["train"]
     steps = spec.steps or tcfg["steps"]
@@ -156,6 +153,15 @@ def train_run(spec: RunSpec, ctx: Context, log_dir: Path | None = None, eval_sce
             log.append({"step": done_steps, "val_f1": f1})
             if steps_to_target is None and f1 >= target:
                 steps_to_target = done_steps
+        if step_hook is not None:
+            _sync(device)
+            t0 = time.perf_counter()
+            stop = step_hook(done_steps, model)
+            _sync(device)
+            eval_time += time.perf_counter() - t0
+            if stop:
+                reason = reason or "stopped_by_hook"
+                break
         if (time.perf_counter() - t_start - eval_time) / 60 > tcfg["time_limit_min"]:
             reason = reason or "time_limit"
             break

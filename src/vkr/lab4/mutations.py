@@ -208,6 +208,18 @@ def build_set(df: pd.DataFrame, spec: dict, split: str, mut_cfg: dict, seed: int
     return pd.concat(parts, ignore_index=True)
 
 
+def scenario_test_sets(scenarios_cfg: dict, mut_cfg: dict, copies_test: int, test_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Мутированные test-таблицы сценариев S0-S4 и MAIN (всё, кроме марковского S5). Единственное место, где они строятся:
+    её используют и Context (обучение), и этап 7 (bootstrap по документам), порядок строк в обоих случаях одинаков."""
+    out: dict[str, pd.DataFrame] = {}
+    for name, s in scenarios_cfg["scenarios"].items():
+        if "mutations" in s:
+            copies = 1 if name == "S0" else copies_test
+            out[name] = build_set(test_df, s["mutations"], "test", mut_cfg, mut_cfg["seeds"]["test"], copies,
+                                  keep_original=(name == "S0"))
+    return out
+
+
 # ---------------------------------------------------------------- S5: марковское переключение версий
 def markov_chain(n_docs: int, stay: float, versions: list[str], start: str, rng: np.random.Generator) -> list[str]:
     """Цепь версий шаблона по документам: остаёмся с вероятностью stay, иначе одна из остальных поровну."""

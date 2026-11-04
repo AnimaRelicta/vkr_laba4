@@ -39,3 +39,25 @@ def test_same_seed_is_reproducible(ctx):
 def test_diverging_run_is_flagged(ctx):
     row = train_run(RunSpec("pilot", "sgd", 1e6, 0), ctx, None, eval_scenarios=False)
     assert row["unstable"] == 1
+
+
+def test_step_hook_stops_training(ctx):
+    calls = []
+    row = train_run(RunSpec("noise", "adam", 1e-3, 0), ctx, None, eval_scenarios=False,
+                    step_hook=lambda step, model: (calls.append(step), step == 20)[1])
+    assert row["steps_done"] == 20 and calls[-1] == 20 and calls[0] == 1
+
+
+def test_gradient_noise_decreases_with_batch(ctx):
+    import numpy as np
+
+    from vkr.lab4.noise import collect_moments
+    from vkr.lab4.train import _labels
+    tr, backend = ctx.train_set(0), ctx.backend
+    items = [backend.encode_one(h, v) for h, v in zip(tr["header_text"], tr["values_sample"])]
+    y = torch.tensor(_labels(tr), dtype=torch.long)
+    model = backend.build_model(0)
+    params = [p for p in model.parameters() if p.requires_grad]
+    m = collect_moments(model, backend, items, y, params, [8, 32], 30, 32, "cpu", np.random.default_rng(0), log=lambda *a: None)
+    assert m[8]["trace_cov"] > m[32]["trace_cov"] > 0
+    assert abs(m[32]["cos_to_ref"] - 1.0) < 1e-5 and m[8]["n"] == 30

@@ -67,8 +67,13 @@ uv run lab4 main
 # этап 6: статистика, сводный балл, гипотезы, графики -> results/<backend>/stats/report.md
 uv run lab4 stats
 
-# этап 7: sensitivity для топ-3 по баллу + SGD
+# этап 7: sensitivity для топ-2 по баллу + SGD (2 seed, как в замороженном protocol.yaml)
 uv run lab4 sens
+# этап 7: шум градиента на чекпоинте (нужен GPU): финалисты + sgd, seed 0; ~10 мин на оптимизатор
+uv run lab4 noise
+# этап 7: таблицы sensitivity, плато по LR, ранги, bootstrap по документам, LOCO, шум, карта случайности
+# -> results/<backend>/stochastic/report.md (без torch; для bootstrap/LOCO нужны данные ЛР1 и results/<backend>/probs/)
+uv run lab4 stoch
 
 uv run lab4 status                            # сколько запусков выполнено
 ```
@@ -81,7 +86,7 @@ uv run lab4 status                            # сколько запусков 
 | Путь | Что |
 | --- | --- |
 | `configs/protocol.yaml, grid.yaml, mutations.yaml, scenarios.yaml` | параметры эксперимента (замораживаются хешем) |
-| `src/vkr/lab4/` | код: `data`, `mutations`, `features`, `models`, `optimizers`, `train`, `runner`, `stats`, `report`, `cli` |
+| `src/vkr/lab4/` | код: `data`, `mutations`, `features`, `models`, `optimizers`, `train`, `runner`, `stats`, `report`, `stochastic`, `stoch_report`, `noise`, `cli` |
 | `artifacts/` | `data_passport.md`, `split.json` |
 | `results/<backend>/runs.csv` | одна строка на запуск: seed, параметры, метрики, время, память |
 | `results/<backend>/logs/` | кривые сходимости: train loss и норма градиента каждые 50 шагов, val F1 каждые 100 |

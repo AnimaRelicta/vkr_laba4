@@ -1,0 +1,1227 @@
+diff --git a/PROTOCOL.md b/PROTOCOL.md
+index b172b52..05d457f 100644
+--- a/PROTOCOL.md
++++ b/PROTOCOL.md
+@@ -93,3 +93,15 @@ S5: цепь версий T0 (исходная), T1 (все заголовки 
+ и записать сюда: _(заполнить: с/шаг, micro_batch, пик памяти, часы по этапам из `lab4 bench`)_.
+ 
+ Ускорения относительно первой версии: шагов 80 вместо 600 (данные малы: 17 уникальных заголовков, около 0,9 эпохи), при подборе LR нет промежуточных оценок val, 1 tuning-seed вместо 2, 5 seed вместо 10, sensitivity на 2 seed и 3 оптимизаторах, база Qwen читается с диска один раз (копия на запуск), micro_batch выбирается замером. Замер на RTX 4060: micro_batch 8: 1,341 с/шаг; 16: 0,825 (4,4 ГБ); 24: 0,861 (6,1 ГБ, выше не имеет смысла: GPU уже загружена). Оценка: tune 1,2 ч + main 1,1 ч + sens 1,5 ч ≈ 3,8 ч при 80 шагах; при 60 шагах ≈ 3,1 ч. Если и этого много, резать число точек LR в tune.
++
++## 10. Этап 7: стохастический анализ (определения, не зависят от результатов)
++
++Заморожено в `configs/`: sensitivity на **топ-2 по сводному баллу + SGD, `sens_seeds` = [0, 1]** (два seed, не пять), множители LR 0,1...10, batch size 32/64/128, weight decay 0/1e-4/1e-2; шум градиента: чекпоинт шага 40, 200 мини-батчей, batch 16/32/64/128. Два seed дают описательную, а не статистическую картину. Команды: `lab4 sens`, `lab4 noise`, `lab4 stoch` (раздел `--only sens|noise|robust|map`).
++
++- **Плато по LR**: непрерывный участок вокруг лучшего уровня, где F1 не ниже лучшего минус δ (δ = 0,01; 0,02; 0,05; основной 0,02 = порог H2); границы линейно интерполируются; упёрлось в край сетки - ширина оценена снизу (censored). Расходящийся запуск считается за F1 = 0, как в `select-lr`.
++- **Rank-диаграмма и устойчивость порядка**: ранг оптимизаторов по условиям каждого фактора, число разных победителей, средний Spearman между условиями.
++- **Воспроизводимость**: базовый sens-запуск (LR x1, batch 64, weight decay по умолчанию) совпадает по конфигурации с main для seed 0 и 1; разница F1 должна быть нулевой, ненулевая - недетерминизм GPU (указать в карте случайности).
++- **Шум градиента**: запуск идёт как в main (LR из `selected_lr.json`, расписание на 80 шагов) до шага 40; затем для каждого B 200 мини-батчей без возвращения, градиент как в обучении (dropout включён, без клиппинга), моменты потоково. E‖g_B‖² = |G|² + tr Σ_1 / B; B_simple = tr Σ_1 / |G|² (McCandlish et al., 2018). Один seed, оптимизаторы: финалисты + SGD.
++- **Bootstrap по документам и кластерам**: единица перевыборки - документ (или кластер) целиком; одна перевыборка на всех оптимизаторов и seed, разности парные. Модели не переобучаются: берутся `results/<backend>/probs/*.npz`; пересчитанный F1 сверяется с `runs.csv`, при расхождении анализ останавливается.
++- **Leave-one-cluster-out**: F1 без документов одного кластера test (и только на нём) при фиксированных моделях. Это не переобучение с отложенным кластером; при менее чем трёх кластерах в test метод вырожден.
++- **Карта случайности**: источники (seed, порядок батчей, dropout, мутации train, выбор LR, мутации val/test, выборка test, цепь S5, железо, лимит времени) с числами из результатов.
+diff --git a/README.md b/README.md
+index 7814d81..0bdcf5c 100644
+--- a/README.md
++++ b/README.md
+@@ -67,8 +67,13 @@ uv run lab4 main
+ # этап 6: статистика, сводный балл, гипотезы, графики -> results/<backend>/stats/report.md
+ uv run lab4 stats
+ 
+-# этап 7: sensitivity для топ-3 по баллу + SGD
++# этап 7: sensitivity для топ-2 по баллу + SGD (2 seed, как в замороженном protocol.yaml)
+ uv run lab4 sens
++# этап 7: шум градиента на чекпоинте (нужен GPU): финалисты + sgd, seed 0; ~10 мин на оптимизатор
++uv run lab4 noise
++# этап 7: таблицы sensitivity, плато по LR, ранги, bootstrap по документам, LOCO, шум, карта случайности
++# -> results/<backend>/stochastic/report.md (без torch; для bootstrap/LOCO нужны данные ЛР1 и results/<backend>/probs/)
++uv run lab4 stoch
+ 
+ uv run lab4 status                            # сколько запусков выполнено
+ ```
+@@ -81,7 +86,7 @@ uv run lab4 status                            # сколько запусков
+ | Путь | Что |
+ | --- | --- |
+ | `configs/protocol.yaml, grid.yaml, mutations.yaml, scenarios.yaml` | параметры эксперимента (замораживаются хешем) |
+-| `src/vkr/lab4/` | код: `data`, `mutations`, `features`, `models`, `optimizers`, `train`, `runner`, `stats`, `report`, `cli` |
++| `src/vkr/lab4/` | код: `data`, `mutations`, `features`, `models`, `optimizers`, `train`, `runner`, `stats`, `report`, `stochastic`, `stoch_report`, `noise`, `cli` |
+ | `artifacts/` | `data_passport.md`, `split.json` |
+ | `results/<backend>/runs.csv` | одна строка на запуск: seed, параметры, метрики, время, память |
+ | `results/<backend>/logs/` | кривые сходимости: train loss и норма градиента каждые 50 шагов, val F1 каждые 100 |
+diff --git a/TODO.md b/TODO.md
+index ef2de43..44705a1 100644
+--- a/TODO.md
++++ b/TODO.md
+@@ -55,11 +55,11 @@
+ 
+ ## Этап 7. Стохастический анализ (2 дня)
+ 
+-- [~] Sensitivity по LR, batch size, weight decay для топ-3 + SGD, 5 seed (`lab4 sens`)
+-- [ ] rank-диаграмма и ширина «плато» по LR (графики по результатам sens)
+-- [ ] Шум градиента на чекпоинте шага 40: 200 мини-батчей, batch 16/32/64/128 (параметры в `grid.yaml: noise`, кода пока нет)
+-- [ ] Bootstrap по документам и leave-one-cluster-out для трёх финалистов
+-- [ ] Карта источников случайности для отчёта
++- [~] Sensitivity по LR, batch size, weight decay для топ-2 + SGD, 2 seed (0 и 1) по замороженному protocol.yaml (`lab4 sens`); формулировка «топ-3, 5 seed» устарела. Порядок этапа: `sens` -> `noise` -> `stoch`
++- [~] rank-диаграмма и ширина «плато» по LR (`lab4 stoch`: sens_ranks.png, plateau_*.csv); выполнить после `lab4 sens`
++- [~] Шум градиента на чекпоинте шага 40: 200 мини-батчей, batch 16/32/64/128 (`lab4 noise`, параметры в `grid.yaml: noise`); выполнить
++- [~] Bootstrap по документам и leave-one-cluster-out для трёх финалистов (`lab4 stoch`; LOCO без переобучения: кластер убирается из оценки test); выполнить
++- [~] Карта источников случайности для отчёта (раздел `lab4 stoch`, числа подставляются из результатов)
+ - [x] Сценарии S0-S5 (S5: 100 розыгрышей цепи Маркова) считаются в каждом основном запуске
+ 
+ ## Этап 8. Перенос в ВКР: каскад (1,5 дня)
+diff --git a/src/vkr/lab4/budget.py b/src/vkr/lab4/budget.py
+index 91070c2..4fc486d 100644
+--- a/src/vkr/lab4/budget.py
++++ b/src/vkr/lab4/budget.py
+@@ -35,5 +35,6 @@ def smoke_config(cfg, steps: int = 8):
+     for fam in cfg.grid["lr_grid"].values():
+         fam["n"] = 2                     # концы сетки: проверяется и расходящийся запуск (SGD lr=1)
+     cfg.grid["sensitivity"].update(optimizers_top=2, lr_multipliers=[1.0, 3.0], batch_sizes=[32, 64], weight_decays=[0.0, 0.01])
++    cfg.grid["noise"].update(checkpoint_step=max(1, steps // 2), n_batches=3, batch_sizes=[4, 8])
+     cfg.protocol["paths"]["results"] = "results_smoke"
+     return cfg
+diff --git a/src/vkr/lab4/cli.py b/src/vkr/lab4/cli.py
+index 4905912..3c15dfc 100644
+--- a/src/vkr/lab4/cli.py
++++ b/src/vkr/lab4/cli.py
+@@ -172,8 +172,14 @@ def cmd_smoke(args):
+     opts = top_for_sensitivity(cfg)
+     print("sensitivity для:", opts)
+     execute(sens_specs(cfg, opts), ctx, eval_scenarios=True)
++    print("== noise")
++    from .noise import run_noise
++    run_noise(cfg, ctx, ["adam", "sgd"], [0])
+     print("== stats")
+     print("Отчёт:", build_report(cfg, read_runs(cfg)))
++    print("== stoch")
++    from .stoch_report import build_stoch_report
++    print("Отчёт:", build_stoch_report(cfg, read_runs(cfg), None, 200))
+     print(f"SMOKE OK. Результаты проверки лежат в {cfg.results_dir} (в основные results/ не попадают, можно удалить).")
+ 
+ 
+@@ -217,6 +223,20 @@ def cmd_sens(args):
+     execute(sens_specs(cfg, opts), _context(cfg), eval_scenarios=True)
+ 
+ 
++def cmd_noise(args):
++    from .noise import run_noise
++    cfg = _cfg(args)
++    check_lock()
++    run_noise(cfg, _context(cfg), args.optimizers, args.seeds, args.n_batches)
++
++
++def cmd_stoch(args):
++    from .runner import read_runs
++    from .stoch_report import build_stoch_report
++    cfg = _cfg(args)
++    print("Отчёт:", build_stoch_report(cfg, read_runs(cfg), args.only, args.bootstrap))
++
++
+ def cmd_stats(args):
+     from .report import build_report
+     from .runner import read_runs
+@@ -266,7 +286,14 @@ def main(argv=None):
+     add("tune", cmd_tune, "этап 4: подбор LR (8 x 7 x 2 запуска)")
+     add("select-lr", cmd_select_lr, "выбрать LR по результатам tune")
+     add("main", cmd_main, "этап 5: 8 оптимизаторов x 10 seed + сценарии S0-S5")
+-    add("sens", cmd_sens, "этап 7: sensitivity (LR, batch size, weight decay)")
++    add("sens", cmd_sens, "этап 7: запуски sensitivity (LR, batch size, weight decay)")
++    p = add("noise", cmd_noise, "этап 7: шум градиента на чекпоинте (нужен torch и GPU)")
++    p.add_argument("--optimizers", nargs="*", help="по умолчанию: финалисты (топ-3 по баллу) + sgd")
++    p.add_argument("--seeds", type=int, nargs="*", default=[0])
++    p.add_argument("--n-batches", type=int, default=0, help="только для проверки: переопределить grid.yaml (отступление нужно отметить в отчёте)")
++    p = add("stoch", cmd_stoch, "этап 7: sensitivity-таблицы, плато, bootstrap по документам, LOCO, шум, карта случайности (без torch)")
++    p.add_argument("--only", nargs="*", choices=["sens", "noise", "robust", "map"], help="только эти разделы")
++    p.add_argument("--bootstrap", type=int, default=2000, help="число перевыборок")
+     add("stats", cmd_stats, "этап 6: статистика, сводный балл, гипотезы, графики")
+     add("status", cmd_status, "сколько запусков выполнено")
+     args = ap.parse_args(argv)
+diff --git a/src/vkr/lab4/mutations.py b/src/vkr/lab4/mutations.py
+index d428d67..072dcdf 100644
+--- a/src/vkr/lab4/mutations.py
++++ b/src/vkr/lab4/mutations.py
+@@ -208,6 +208,18 @@ def build_set(df: pd.DataFrame, spec: dict, split: str, mut_cfg: dict, seed: int
+     return pd.concat(parts, ignore_index=True)
+ 
+ 
++def scenario_test_sets(scenarios_cfg: dict, mut_cfg: dict, copies_test: int, test_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
++    """Мутированные test-таблицы сценариев S0-S4 и MAIN (всё, кроме марковского S5). Единственное место, где они строятся:
++    её используют и Context (обучение), и этап 7 (bootstrap по документам), порядок строк в обоих случаях одинаков."""
++    out: dict[str, pd.DataFrame] = {}
++    for name, s in scenarios_cfg["scenarios"].items():
++        if "mutations" in s:
++            copies = 1 if name == "S0" else copies_test
++            out[name] = build_set(test_df, s["mutations"], "test", mut_cfg, mut_cfg["seeds"]["test"], copies,
++                                  keep_original=(name == "S0"))
++    return out
++
++
+ # ---------------------------------------------------------------- S5: марковское переключение версий
+ def markov_chain(n_docs: int, stay: float, versions: list[str], start: str, rng: np.random.Generator) -> list[str]:
+     """Цепь версий шаблона по документам: остаёмся с вероятностью stay, иначе одна из остальных поровну."""
+diff --git a/src/vkr/lab4/noise.py b/src/vkr/lab4/noise.py
+new file mode 100644
+index 0000000..a559b7f
+--- /dev/null
++++ b/src/vkr/lab4/noise.py
+@@ -0,0 +1,120 @@
++"""Шум градиента на чекпоинте (этап 7, grid.yaml: noise). Нужен torch.
++
++Обучаем оптимизатор с выбранным LR до шага checkpoint_step (полный протокол: тот же seed, то же расписание LR,
++как в main), затем на замороженных весах собираем n_batches градиентов для каждого batch size и считаем моменты
++потоково (Welford): след ковариации, квадрат нормы среднего градиента, средний квадрат нормы.
++Модель остаётся в train-режиме: dropout LoRA и головы входит в шум, как и в обучении. Градиенты берутся до clipping.
++Оценки масштаба шума по моментам - в stochastic.noise_scale (без torch).
++"""
++from __future__ import annotations
++
++import json
++import time
++
++import numpy as np
++
++
++def collect_moments(model, backend, items, y_all, params, batch_sizes, n_batches, micro, device, rng, log=print) -> dict:
++    import torch
++    from torch import nn
++
++    loss_fn = nn.CrossEntropyLoss(reduction="sum")
++    model.train()
++    out, means = {}, {}
++    for B in batch_sizes:
++        if B > len(items):
++            raise ValueError(f"batch size {B} больше обучающей выборки ({len(items)})")
++        mean = M2 = None
++        n, sq, losses, t0 = 0, [], [], time.perf_counter()
++        for _ in range(n_batches):
++            idx = rng.choice(len(items), size=B, replace=False)
++            model.zero_grad(set_to_none=True)
++            total = 0.0
++            for j in range(0, B, micro or B):
++                sub = idx[j:j + (micro or B)]
++                batch = backend.collate([items[i] for i in sub], device)
++                loss = loss_fn(model(**batch).float(), y_all[sub].to(device)) / B
++                loss.backward()
++                total += loss.item()
++            g = torch.cat([(p.grad if p.grad is not None else torch.zeros_like(p)).reshape(-1) for p in params]).double()
++            if not bool(torch.isfinite(g).all()):
++                continue
++            if mean is None:
++                mean, M2 = torch.zeros_like(g), torch.zeros_like(g)
++            n += 1
++            d = g - mean
++            mean += d / n
++            M2 += d * (g - mean)
++            sq.append(float(g.dot(g)))
++            losses.append(total)
++        if n < 2:
++            raise RuntimeError(f"batch size {B}: меньше двух конечных градиентов из {n_batches}")
++        out[B] = {"n": n, "mean_sq_norm": float(np.mean(sq)), "mean_norm_sq": float(mean.dot(mean)),
++                  "trace_cov": float(M2.sum()) / (n - 1), "mean_loss": float(np.mean(losses)),
++                  "seconds": round(time.perf_counter() - t0, 1)}
++        means[B] = mean.float().cpu()
++        log(f"  batch {B:4d}: tr(Cov)={out[B]['trace_cov']:.4g}  |mean|^2={out[B]['mean_norm_sq']:.4g}  ({out[B]['seconds']} с)")
++    ref = means[max(means)]
++    for B, m in means.items():
++        out[B]["cos_to_ref"] = float(torch.nn.functional.cosine_similarity(m, ref, dim=0))
++    model.zero_grad(set_to_none=True)
++    return out
++
++
++def run_noise(cfg, ctx, optimizers=None, seeds=(0,), n_batches=None) -> list:
++    """Для каждого (оптимизатор, seed) пишет results/<backend>/noise/noise_<opt>_s<seed>.json. Возобновляемо."""
++    import torch
++
++    from .runner import load_selected_lr, read_runs
++    from .spec import RunSpec
++    from .stochastic import finalists
++    from .train import _labels, train_run
++
++    ncfg, tcfg = cfg.grid["noise"], cfg.protocol["train"]
++    ckpt, bss = ncfg["checkpoint_step"], list(ncfg["batch_sizes"])
++    nb = n_batches or ncfg["n_batches"]
++    if nb != ncfg["n_batches"]:
++        print(f"ВНИМАНИЕ: n_batches={nb} вместо {ncfg['n_batches']} из grid.yaml - отметьте отступление в отчёте.")
++    if ckpt > tcfg["steps"]:
++        raise SystemExit(f"checkpoint_step {ckpt} больше числа шагов {tcfg['steps']}")
++    lrs = load_selected_lr(cfg)
++    if optimizers is None:
++        runs = read_runs(cfg)
++        optimizers = finalists(runs, cfg.protocol["selection"], tcfg["steps"]) + ["sgd"]
++        optimizers = list(dict.fromkeys(optimizers))
++    out_dir = cfg.results_dir / "noise"
++    out_dir.mkdir(parents=True, exist_ok=True)
++    print(f"Шум градиента: {optimizers}, seed {list(seeds)}, чекпоинт {ckpt}, batch {bss}, {nb} батчей на размер "
++          f"(~{nb * sum(bss) * 0.0135 / 60:.0f} мин на запуск при Qwen на RTX 4060)")
++    done = []
++    for o in optimizers:
++        for seed in seeds:
++            path = out_dir / f"noise_{o}_s{seed}.json"
++            if path.exists():
++                print(f"{path.name}: уже есть, пропуск")
++                continue
++            spec = RunSpec("noise", o, lrs[o], seed, tcfg["batch_size"])
++            tr = ctx.train_set(seed)
++            items = [ctx.backend.encode_one(h, v) for h, v in zip(tr["header_text"], tr["values_sample"])]
++            y_all = torch.tensor(_labels(tr), dtype=torch.long)
++            result: dict = {}
++
++            def hook(step, model, _o=o, _seed=seed, _items=items, _y=y_all, _res=result):
++                if step != ckpt:
++                    return False
++                print(f"{_o} seed {_seed}: чекпоинт шага {step}, сбор градиентов")
++                params = [p for p in model.parameters() if p.requires_grad]
++                rng = np.random.default_rng(10_000 + _seed)
++                _res.update(collect_moments(model, ctx.backend, _items, _y, params, bss, nb, ctx.backend.micro_batch,
++                                            ctx.device, rng))
++                return True
++
++            train_run(spec, ctx, None, eval_scenarios=False, step_hook=hook)
++            if not result:
++                print(f"{o} seed {seed}: чекпоинт {ckpt} не достигнут (обучение остановилось раньше, см. нестабильность), пропуск")
++                continue
++            path.write_text(json.dumps({"optimizer": o, "seed": seed, "lr": lrs[o], "checkpoint_step": ckpt,
++                                        "n_batches": nb, "moments": {str(k): v for k, v in result.items()}},
++                                       ensure_ascii=False, indent=1), encoding="utf-8")
++            done.append(path)
++    return done
+diff --git a/src/vkr/lab4/stoch_report.py b/src/vkr/lab4/stoch_report.py
+new file mode 100644
+index 0000000..3fd470e
+--- /dev/null
++++ b/src/vkr/lab4/stoch_report.py
+@@ -0,0 +1,379 @@
++"""Сборка results/<backend>/stochastic/: таблицы, графики и report.md этапа 7. Без torch.
++
++Каждый раздел строится, только если есть его входные данные; чего не хватает, отмечено в отчёте.
++"""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import numpy as np
++import pandas as pd
++
++from . import stochastic as X
++from .optimizers import OPTIMIZERS
++
++_COLORS = {o: c for o, c in zip(OPTIMIZERS, ["#6b7280", "#8c564b", "#e377c2", "#2ca02c", "#d62728", "#1f77b4", "#ff7f0e", "#9467bd"])}
++
++
++def md(df: pd.DataFrame, floatfmt: str = "{:.4f}") -> str:
++    if df is None or not len(df):
++        return "_нет данных_\n"
++    head = "| " + " | ".join(map(str, df.columns)) + " |"
++    sep = "| " + " | ".join("---" for _ in df.columns) + " |"
++    rows = ["| " + " | ".join(floatfmt.format(v) if isinstance(v, (float, np.floating)) and np.isfinite(v) else str(v) for v in r) + " |"
++            for r in df.itertuples(index=False)]
++    return "\n".join([head, sep] + rows) + "\n"
++
++
++def _plt():
++    import matplotlib
++    matplotlib.use("Agg")
++    import matplotlib.pyplot as plt
++    return plt
++
++
++# ------------------------------------------------------------------ sensitivity
++def _plot_sens(t: pd.DataFrame, out: Path) -> list[str]:
++    plt = _plt()
++    made = []
++    for kind, fname, ylab in (("f1", "sens_curves.png", "test Macro-F1 (MAIN), среднее по seed"), ("rank", "sens_ranks.png", "ранг (1 = лучший)")):
++        fig, axes = plt.subplots(1, 3, figsize=(13, 4), sharey=(kind == "rank"))
++        for ax, f in zip(axes, X.FACTORS):
++            g = t[t["factor"] == f]
++            xs = sorted(g["x"].unique())
++            for o, go in g.groupby("optimizer"):
++                go = go.set_index("x").reindex(xs)
++                pos = np.arange(len(xs))
++                if kind == "f1":
++                    ax.errorbar(pos, go["f1"], yerr=go["f1_sd"].fillna(0), marker="o", capsize=3, label=o, color=_COLORS.get(o))
++                else:
++                    ax.plot(pos, go["rank"], marker="o", lw=2, label=o, color=_COLORS.get(o))
++            ax.set_xticks(np.arange(len(xs)))
++            ax.set_xticklabels([f"{x:g}" for x in xs])
++            ax.set_xlabel(X.FACTORS[f][1])
++            if kind == "rank":
++                ax.invert_yaxis()
++            ax.grid(alpha=0.3)
++        axes[0].set_ylabel(ylab)
++        axes[-1].legend(fontsize=8)
++        fig.tight_layout()
++        fig.savefig(out / fname, dpi=150)
++        plt.close(fig)
++        made.append(fname)
++    return made
++
++
++def _plot_tune(tune: pd.DataFrame, plat: pd.DataFrame, out: Path, grid: dict) -> str:
++    plt = _plt()
++    fams = {"adam": "Adam-семейство", "sgd": "SGD-семейство"}
++    fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharey=True)
++    for ax, (fam, title) in zip(axes, fams.items()):
++        for o, g in tune.groupby("optimizer"):
++            if grid["optimizers"][o]["family"] != fam:
++                continue
++            g = g.sort_values("lr")
++            ax.plot(g["lr"], g["val_f1_mean"], marker="o", label=o, color=_COLORS.get(o))
++            s = g[g["selected"]]
++            ax.scatter(s["lr"], s["val_f1_mean"], s=140, facecolors="none", edgecolors="k", zorder=5)
++        ax.set_xscale("log")
++        ax.set_xlabel("LR")
++        ax.set_title(title)
++        ax.grid(alpha=0.3)
++        ax.legend(fontsize=8)
++    axes[0].set_ylabel("val Macro-F1 (tune, один seed)")
++    fig.tight_layout()
++    fig.savefig(out / "tune_curves.png", dpi=150)
++    plt.close(fig)
++    return "tune_curves.png"
++
++
++def section_sens(cfg, runs: pd.DataFrame, out: Path) -> list[str]:
++    from .runner import load_selected_lr
++
++    L = ["## Sensitivity (sens): LR, batch size, weight decay\n"]
++    sens = runs[runs["phase"] == "sens"]
++    if sens.empty:
++        L.append("Запусков фазы sens нет: выполните `uv run lab4 sens`.\n")
++    else:
++        bs0 = cfg.protocol["train"]["batch_size"]
++        lrs = load_selected_lr(cfg)
++        t = X.sens_tables(runs, lrs, cfg.grid, bs0)
++        t.to_csv(out / "sens_table.csv", index=False, encoding="utf-8-sig")
++        st = X.rank_stability(t)
++        st.to_csv(out / "rank_stability.csv", index=False, encoding="utf-8-sig")
++        n = sens.groupby("optimizer")["seed"].nunique()
++        L += [f"Оптимизаторы: {', '.join(sorted(sens['optimizer'].unique()))}; seed на оптимизатор: {n.min()}-{n.max()}. "
++              "Один фактор за раз, остальные на базовых значениях; расходящийся запуск считается за F1 = 0. "
++              "При таком числе seed `f1_sd` - грубая оценка, различия порядка 0,01-0.02 в пределах шума.\n",
++              "### Средний F1 и ранг по условиям\n",
++              md(t[["factor", "optimizer", "x", "f1", "f1_sd", "val", "n_seeds", "unstable", "rank"]].round(4)),
++              "### Устойчивость порядка оптимизаторов\n", md(st)]
++        rep = X.sens_reproducibility(runs, lrs, bs0)
++        if len(rep):
++            rep.to_csv(out / "sens_vs_main.csv", index=False, encoding="utf-8-sig")
++            mx = float(rep["abs_diff"].max())
++            L += ["### Воспроизводимость: базовый sens-запуск против main (тот же оптимизатор, LR, batch, seed)\n",
++                  md(rep.round(6)),
++                  f"Максимальная разница F1: {mx:.3g}. " + ("Запуски воспроизводятся бит-в-бит.\n" if mx < 1e-9 else
++                  "Ненулевая разница: один seed на GPU (bf16, недетерминированные ядра) даёт слегка разный результат; "
++                  "это отдельный источник случайности, указать в карте.\n")]
++        plat = X.plateau_table(t[t["factor"] == "lr"], "f1", True).assign(source="sens, test F1")
++        plat.to_csv(out / "plateau_sens.csv", index=False, encoding="utf-8-sig")
++        L += ["### Ширина плато по LR (sens, test F1)\n",
++              "x - log10 множителя к выбранному LR (сетка множителей 0,1...10 даёт максимум 2 декады). "
++              "`left/right_censored` = плато упирается в край проверенного диапазона, тогда ширина - нижняя оценка.\n",
++              md(plat[plat["delta"] == 0.02].drop(columns=["delta", "source"]).round(3)),
++              "Ширины при допусках 0,01 и 0,05: `plateau_sens.csv`.\n"]
++        L += [f"![sens](stochastic/{f})\n" for f in _plot_sens(t, out)]
++    # плато по сетке tune (все 8 оптимизаторов, val F1, один seed)
++    tp = cfg.results_dir / "tuning" / "tuning_table.csv"
++    if tp.exists():
++        tune = pd.read_csv(tp, encoding="utf-8-sig")
++        plat = X.plateau_table(tune.rename(columns={"lr": "x"}), "val_f1_mean", True)
++        plat["best_lr"] = 10 ** plat["best_x"]
++        plat.to_csv(out / "plateau_tune.csv", index=False, encoding="utf-8-sig")
++        sub = plat[plat["delta"] == 0.02][["optimizer", "best_lr", "best_y", "width_decades", "n_points", "left_censored", "right_censored"]]
++        L += ["### Ширина плато по сетке tune (8 оптимизаторов, val F1, один seed, допуск 0,02)\n",
++              "Сетка шагает по половине декады, поэтому плато из одной точки даёт нулевую ширину; обрыв до F1 около 0,02 "
++              "(расходимость) интерполируется линейно между соседними точками, реальная граница устойчивости лежит где-то в этом интервале.\n",
++              md(sub.round(4)), f"![tune](stochastic/{_plot_tune(tune, plat, out, cfg.grid)})\n"]
++    else:
++        L.append("tuning_table.csv не найден: плато по сетке tune не построено.\n")
++    return L
++
++
++# ------------------------------------------------------------------ шум градиента
++def section_noise(cfg, out: Path) -> list[str]:
++    L = ["## Шум градиента на чекпоинте\n"]
++    files = sorted((cfg.results_dir / "noise").glob("noise_*.json"))
++    if not files:
++        L.append("Файлов noise_*.json нет: выполните `uv run lab4 noise`.\n")
++        return L
++    rows, fits = [], []
++    for f in files:
++        d = json.loads(f.read_text(encoding="utf-8"))
++        r = X.noise_rows(d["moments"])
++        r.insert(0, "seed", d["seed"])
++        r.insert(0, "optimizer", d["optimizer"])
++        rows.append(r)
++        fits.append({"optimizer": d["optimizer"], "seed": d["seed"], "lr": d["lr"], **X.noise_scale(d["moments"])})
++    t, fit = pd.concat(rows, ignore_index=True), pd.DataFrame(fits)
++    t.to_csv(out / "noise_by_batch.csv", index=False, encoding="utf-8-sig")
++    fit.to_csv(out / "noise_scale.csv", index=False, encoding="utf-8-sig")
++    ck = json.loads(files[0].read_text(encoding="utf-8"))
++    L += [f"Чекпоинт шага {ck['checkpoint_step']}, {ck['n_batches']} независимых батчей на каждый размер, градиент до clipping, "
++          "модель в train-режиме (dropout включён). `trace_cov_x_B` должно быть почти постоянным (шум ~ 1/B); "
++          "`noise_to_signal` = tr(Cov) / |E g|^2 при данном batch size; `B_simple` = S/|G|^2 - размер батча, при котором шум и сигнал равны.\n",
++          "### По batch size\n", md(t.round(5), "{:.4g}"),
++          "### Масштаб шума (МНК по всем batch size и по паре крайних)\n", md(fit, "{:.4g}")]
++    plt = _plt()
++    fig, ax = plt.subplots(figsize=(6, 4.5))
++    for (o, s), g in t.groupby(["optimizer", "seed"]):
++        ax.plot(g["batch_size"], g["trace_cov"], marker="o", label=f"{o} s{s}", color=_COLORS.get(o))
++    b = np.array(sorted(t["batch_size"].unique()), float)
++    g0 = t.groupby("batch_size")["trace_cov"].mean()
++    ax.plot(b, g0.iloc[0] * b[0] / b, "k--", lw=1, label="наклон -1")
++    ax.set_xscale("log", base=2)
++    ax.set_yscale("log")
++    ax.set_xlabel("batch size")
++    ax.set_ylabel("tr Cov градиента")
++    ax.grid(alpha=0.3, which="both")
++    ax.legend(fontsize=8)
++    fig.tight_layout()
++    fig.savefig(out / "noise_scaling.png", dpi=150)
++    plt.close(fig)
++    L.append("![noise](stochastic/noise_scaling.png)\n")
++    return L
++
++
++# ------------------------------------------------------------------ bootstrap по документам и LOCO
++def section_robust(cfg, runs: pd.DataFrame, out: Path, fin: list[str], B: int = 2000) -> list[str]:
++    from .data import load_observations, split_frames
++    from .mutations import scenario_test_sets
++
++    L = ["## Bootstrap по документам и leave-one-cluster-out (test)\n"]
++    if len(fin) < 2:
++        return L + ["Меньше двух финалистов: анализ пропущен.\n"]
++    main = runs[runs["phase"] == "main"]
++    pdir = cfg.results_dir / "probs"
++    if not pdir.exists():
++        return L + ["Нет results/<backend>/probs/: выполните `uv run lab4 main`.\n"]
++    data_dir = Path(cfg.protocol["data"]["dir"])
++    from .config import ROOT
++    data_dir = data_dir if data_dir.is_absolute() else ROOT / data_dir
++    try:
++        test = split_frames(load_observations(data_dir))["test"]
++    except FileNotFoundError as e:
++        return L + [f"Данные не найдены ({e}): передайте `--data <папка с observations.csv>`. Анализ пропущен.\n"]
++    sets = {k: v for k, v in scenario_test_sets(cfg.scenarios, cfg.mutations, cfg.protocol["train"]["copies_test"], test).items()
++            if k in X.SAVED_SCENARIOS}
++    boot_rows, diff_rows, loco_rows, unit_rows, check = [], [], [], [], []
++    for scen, df in sets.items():
++        y = X.labels_of(df)
++        cnt_doc, cnt_cl = {}, {}
++        doc_codes, doc_names = pd.factorize(df["doc_ref"])
++        cl_of_doc = df.drop_duplicates("doc_ref").set_index("doc_ref")["cluster_id"].reindex(doc_names).to_numpy()
++        cl_codes, cl_names = pd.factorize(df["cluster_id"])
++        for o in fin:
++            rs = main[main["optimizer"] == o].sort_values("seed")
++            per_doc, per_cl = [], []
++            for r in rs.itertuples():
++                f = pdir / f"{r.run_id}.npz"
++                if not f.exists():
++                    return L + [f"Нет {f.name}: анализ пропущен."]
++                P = np.load(f)[scen]
++                if len(P) != len(df):
++                    return L + [f"{f.name}[{scen}]: {len(P)} строк, а пересобранный test даёт {len(df)}: данные или конфиг отличаются от прогона main."]
++                pred = P.argmax(1)
++                diff = X.check_against_runs(getattr(r, f"test_f1_{scen}"), y, pred)
++                check.append(diff)
++                if diff > 1e-3:
++                    return L + [f"Пересчитанный F1 расходится с runs.csv на {diff:.4f} ({f.name}, {scen}): порядок строк или данные другие. Анализ остановлен."]
++                per_doc.append(X.count_arrays(y, pred, doc_codes, len(doc_names)))
++                per_cl.append(X.count_arrays(y, pred, cl_codes, len(cl_names)))
++            cnt_doc[o], cnt_cl[o] = np.stack(per_doc), np.stack(per_cl)
++        unit_rows.append({"scenario": scen, "rows": len(df), "docs": len(doc_names), "clusters": len(cl_names)})
++        levels = {"docs": (cnt_doc, len(doc_names))}
++        if len(cl_names) >= 3:
++            levels["clusters"] = (cnt_cl, len(cl_names))
++        for lvl, (cnt, nu) in levels.items():
++            boot = X.bootstrap_units(cnt, nu, B)
++            for o in fin:
++                pe = X.point_estimate(cnt[o])
++                seeds_f1 = [float(X.f1_from_weights(cnt[o][s], np.ones(nu))) for s in range(cnt[o].shape[0])]
++                lo, hi = X.ci(boot[o]["units"])
++                lo2, hi2 = X.ci(boot[o]["units_seeds"])
++                boot_rows.append({"scenario": scen, "level": lvl, "optimizer": o, "f1": pe, "sd_seeds": float(np.std(seeds_f1, ddof=1)),
++                                  "ci_lo": lo, "ci_hi": hi, "sd_boot": float(boot[o]["units"].std()),
++                                  "ci_lo_with_seeds": lo2, "ci_hi_with_seeds": hi2})
++            dd = X.paired_diffs(boot, "units_seeds")
++            dd.insert(0, "level", lvl)
++            dd.insert(0, "scenario", scen)
++            diff_rows.append(dd)
++        lc = X.loco(cnt_doc, cl_of_doc)
++        if len(lc):
++            lc.insert(0, "scenario", scen)
++            loco_rows.append(lc)
++    bt, units = pd.DataFrame(boot_rows), pd.DataFrame(unit_rows)
++    bt.to_csv(out / "bootstrap_ci.csv", index=False, encoding="utf-8-sig")
++    L += [f"Финалисты (топ-{len(fin)} по сводному баллу среди прошедших фильтр): {', '.join(fin)}. "
++          f"Перевыборка {B} раз; единица - документ (все колонки документа идут вместе) и, отдельно, кластер. "
++          f"Пересчитанный F1 совпал с runs.csv (макс. расхождение {max(check):.1e}), то есть порядок строк test восстановлен верно. "
++          "Модели не переобучаются: bootstrap показывает неопределённость оценки по выборке test при данных моделях, "
++          "`ci_with_seeds` добавляет перевыборку seed обучения.\n",
++          "### Размеры test по сценариям\n", md(units),
++          "### F1 и доверительные интервалы\n", md(bt.round(4))]
++    if diff_rows:
++        d = pd.concat(diff_rows, ignore_index=True)
++        d.to_csv(out / "bootstrap_diffs.csv", index=False, encoding="utf-8-sig")
++        L += ["### Парные разности (документы + seed; p_boot - двусторонняя доля реплик по разные стороны нуля)\n", md(d[d["level"] == "docs"].round(4))]
++    if loco_rows:
++        lc = pd.concat(loco_rows, ignore_index=True)
++        lc.to_csv(out / "loco.csv", index=False, encoding="utf-8-sig")
++        L += ["### Leave-one-cluster-out (без переобучения: кластер убирается из оценки)\n",
++              "`delta` = F1 без кластера минус F1 на всём test; `f1_only_cluster` - F1 только на нём. Меняется ли лидер при удалении кластера, видно по `rank_without`.\n",
++              md(lc.round(4))]
++        sub = lc[lc["scenario"] == "MAIN"]
++        if len(sub):
++            lead = {k: g.sort_values("f1_without").iloc[-1]["optimizer"] for k, g in sub.groupby("left_out_cluster")}
++            L.append("Лидер (MAIN) при удалении кластера: " + ", ".join(f"{k}: {v}" for k, v in lead.items()) + ".\n")
++    else:
++        L.append("В test меньше двух кластеров: LOCO не определён.\n")
++    _plot_boot(bt, out)
++    L.append("![boot](stochastic/bootstrap_ci.png)\n")
++    return L
++
++
++def _plot_boot(bt: pd.DataFrame, out: Path) -> None:
++    plt = _plt()
++    g = bt[(bt["scenario"] == "MAIN") & (bt["level"] == "docs")]
++    fig, ax = plt.subplots(figsize=(7, 3.5))
++    for i, r in enumerate(g.itertuples()):
++        ax.errorbar(r.f1, i + 0.12, xerr=[[r.f1 - r.ci_lo], [r.ci_hi - r.f1]], fmt="o", color="C0", capsize=3, label="документы" if i == 0 else None)
++        ax.errorbar(r.f1, i - 0.12, xerr=[[r.f1 - r.ci_lo_with_seeds], [r.ci_hi_with_seeds - r.f1]], fmt="s", color="C1", capsize=3,
++                    label="документы + seed" if i == 0 else None)
++    ax.set_yticks(range(len(g)))
++    ax.set_yticklabels(g["optimizer"])
++    ax.set_xlabel("test Macro-F1 (MAIN), 95 % bootstrap-ДИ")
++    ax.grid(alpha=0.3)
++    ax.legend(fontsize=8)
++    fig.tight_layout()
++    fig.savefig(out / "bootstrap_ci.png", dpi=150)
++    plt.close(fig)
++
++
++# ------------------------------------------------------------------ карта источников случайности
++def section_randomness(cfg, runs: pd.DataFrame, out: Path, fin: list[str]) -> list[str]:
++    """Таблица источников случайности: где фиксирован, где меняется, чем оценён вклад. Числа берутся из файлов, если они есть."""
++    mc, t = cfg.mutations["seeds"], cfg.protocol["train"]
++    main = runs[runs["phase"] == "main"]
++    sd_seed = float("nan")
++    if len(main) and fin:
++        sd_seed = float(np.mean([pd.to_numeric(main[main["optimizer"] == o]["test_f1_main"], errors="coerce").std(ddof=1) for o in fin]))
++
++    def read(name):
++        p = out / name
++        return pd.read_csv(p, encoding="utf-8-sig") if p.exists() else None
++
++    boot, loco, plat, nscale = read("bootstrap_ci.csv"), read("loco.csv"), read("plateau_sens.csv"), read("noise_scale.csv")
++    sd_doc = float(boot[(boot["scenario"] == "MAIN") & (boot["level"] == "docs") & boot["optimizer"].isin(fin)]["sd_boot"].mean()) \
++        if boot is not None and len(boot) else float("nan")
++    loco_rng = float(loco[loco["scenario"] == "MAIN"].groupby("optimizer")["delta"].apply(lambda s: s.max() - s.min()).mean()) \
++        if loco is not None and len(loco) else float("nan")
++    width = float(plat[plat["delta"] == 0.02]["width_decades"].mean()) if plat is not None and len(plat) else float("nan")
++    bsimple = float(nscale["B_simple_fit"].median()) if nscale is not None and len(nscale) else float("nan")
++
++    def f(v, fmt="{:.4f}"):
++        return fmt.format(v) if np.isfinite(v) else "нет данных"
++
++    rows = [
++        ("Разбиение train/val/test", f"из ЛР1, не пересчитывается (split.json); {t['copies_train']} копий train", "нет (фиксировано)",
++         f"LOCO: размах F1 при удалении кластера, среднее по финалистам = {f(loco_rng)}"),
++        ("Выборка документов test", "фиксирована", "нет",
++         f"bootstrap по документам: sd F1 (MAIN) = {f(sd_doc)}"),
++        ("Мутации train", f"seed = {mc['train_base']} + seed запуска", "да, между seed",
++         "входит в разброс по seed"),
++        ("Мутации val/test", f"seed val = {mc['val']}, test = {mc['test']}", "нет, одинаковы для всех оптимизаторов",
++         "сценарии S0-S5 разделяют F1 при одинаковых мутациях"),
++        ("Инициализация LoRA и головы", "torch.manual_seed(seed) в build_model", "да, между seed", "разброс по seed"),
++        ("Порядок и состав батчей", "np.random.default_rng(seed).permutation", "да, между seed", "разброс по seed; шум градиента (ниже)"),
++        ("Dropout (LoRA 0,05, голова 0,2)", "torch RNG после seed", "да, между seed", "разброс по seed; входит в замер шума градиента"),
++        ("Разброс по seed обучения", f"{len(t['eval_seeds'])} seed в main ({t['eval_seeds']})", "-",
++         f"sd test F1 (MAIN), среднее по финалистам = {f(sd_seed)}"),
++        ("Выбор LR", f"tune: seed {t['tuning_seeds']}, один запуск на точку сетки", "нет (одна реализация)",
++         f"плато по LR: средняя ширина {f(width, '{:.2f}')} декады (sens, допуск 0,02)"),
++        ("Шум градиента", f"шаг {cfg.grid['noise']['checkpoint_step']}, {cfg.grid['noise']['n_batches']} батчей, batch {cfg.grid['noise']['batch_sizes']}", "да (мини-батч)",
++         f"B_simple (медиана по запускам) = {f(bsimple, '{:.0f}')}; рабочий batch = {t['batch_size']}"),
++        ("S5: цепь Маркова версий шаблона", f"{cfg.scenarios['scenarios']['S5']['markov']['draws']} розыгрышей, seed test", "да, внутри запуска",
++         "test_f1_S5_sd в runs.csv"),
++        ("Bootstrap ДИ", "seed 0, 10000 ресэмплов (по seed обучения)", "нет", "воспроизводим"),
++        ("Недетерминизм CUDA и bf16", "не контролируется", "да, слабо",
++         "не оценивался отдельно; повторный запуск того же seed даёт близкие, но не обязательно побитово равные метрики"),
++    ]
++    df = pd.DataFrame(rows, columns=["Источник", "Как задан", "Меняется между запусками", "Чем оценён вклад"])
++    return ["## Карта источников случайности\n", md(df)]
++
++
++# ------------------------------------------------------------------ сборка
++def build_stoch_report(cfg, runs: pd.DataFrame, only: list[str] | None = None, B: int = 2000) -> Path:
++    out = cfg.results_dir / "stochastic"
++    out.mkdir(parents=True, exist_ok=True)
++    want = set(only or ["sens", "noise", "robust", "map"])
++    main = runs[runs["phase"] == "main"]
++    fin: list[str] = []
++    if len(main):
++        fin = X.finalists(runs, cfg.protocol["selection"], cfg.protocol["train"]["steps"])
++    L = ["# Стохастический анализ (этап 7)\n",
++         f"Бэкенд: {cfg.backend}. Финалисты: {', '.join(fin) if fin else 'нет данных main'}.\n"]
++    if "sens" in want:
++        L += section_sens(cfg, runs, out)
++    if "noise" in want:
++        L += section_noise(cfg, out)
++    if "robust" in want:
++        L += section_robust(cfg, runs, out, fin, B)
++    if "map" in want:
++        L += section_randomness(cfg, runs, out, fin)
++    p = out / "report.md"
++    p.write_text("\n".join(L), encoding="utf-8")
++    return p
+diff --git a/src/vkr/lab4/stochastic.py b/src/vkr/lab4/stochastic.py
+new file mode 100644
+index 0000000..a8780fd
+--- /dev/null
++++ b/src/vkr/lab4/stochastic.py
+@@ -0,0 +1,268 @@
++"""Этап 7: стохастический анализ без torch (работает по runs.csv, tuning_table.csv, probs/*.npz и json шума градиента).
++
++Что здесь считается:
++  * sensitivity: таблицы по LR / batch size / weight decay, ранги, ширина «плато» по LR;
++  * bootstrap по документам (и по кластерам) для финалистов, парные разности;
++  * leave-one-cluster-out на test (без переобучения: убираем кластер из оценки, модели те же);
++  * оценка масштаба шума градиента по моментам, собранным в noise.py.
++"""
++from __future__ import annotations
++
++import warnings
++
++import numpy as np
++import pandas as pd
++from scipy import stats as sst
++
++from . import stats as S
++from .labels import LABEL2ID, N_CLASSES
++from .metrics import macro_f1
++
++DELTAS = (0.01, 0.02, 0.05)             # допуски «плато»: падение F1 от максимума
++SAVED_SCENARIOS = ("S0", "S3", "S4", "MAIN")   # сценарии, для которых train_run сохраняет вероятности
++FACTORS = {"lr": ("lr_mult", "LR, множитель к выбранному"), "bs": ("batch_size", "batch size"), "wd": ("wd", "weight decay")}
++
++
++# ------------------------------------------------------------------ финалисты
++def finalists(runs: pd.DataFrame, sel: dict, steps: int, k: int = 3) -> list[str]:
++    """Топ-k по сводному баллу среди оптимизаторов, прошедших фильтр нестабильности (то же правило, что в stats)."""
++    main = runs[runs["phase"] == "main"]
++    summ = S.summarize(main, sel, steps)
++    score = S.composite(summ, sel["weights"])
++    ok = summ.index[summ["unstable_share"] <= sel["max_unstable_share"] + 1e-12]
++    return list(score.loc[ok].sort_values(ascending=False).index[:k])
++
++
++# ------------------------------------------------------------------ sensitivity
++def sens_tidy(runs: pd.DataFrame, lrs: dict, grid: dict) -> pd.DataFrame:
++    """Запуски фазы sens с эффективными значениями факторов. Пустой weight_decay в runs.csv = значение по умолчанию из grid.yaml."""
++    d = runs[runs["phase"] == "sens"].copy()
++    for c in ("lr", "batch_size", "weight_decay", "val_f1_final", "test_f1_main", "unstable", "seed"):
++        d[c] = pd.to_numeric(d[c], errors="coerce")
++    d["lr_mult"] = (d["lr"] / d["optimizer"].map(lrs)).round(3)
++    base_wd = d["optimizer"].map(lambda o: float(grid["optimizers"][o].get("weight_decay", 0.0)))
++    d["wd_is_base"] = d["weight_decay"].isna()
++    d["wd"] = d["weight_decay"].fillna(base_wd)
++    d["f1"] = d["test_f1_main"].fillna(0.0)       # расходящийся запуск = 0, как в select_lr
++    d["val"] = d["val_f1_final"].fillna(0.0)
++    return d
++
++
++def factor_table(d: pd.DataFrame, factor: str, bs0: int) -> pd.DataFrame:
++    """Один фактор за раз: остальные на базовых значениях. Базовая точка входит в таблицу каждого фактора."""
++    x = FACTORS[factor][0]
++    if factor == "lr":
++        m = (d["batch_size"] == bs0) & d["wd_is_base"]
++    elif factor == "bs":
++        m = (d["lr_mult"] == 1.0) & d["wd_is_base"]
++    else:
++        m = (d["lr_mult"] == 1.0) & (d["batch_size"] == bs0)
++    g = (d[m].groupby(["optimizer", x])
++         .agg(f1=("f1", "mean"), f1_sd=("f1", "std"), val=("val", "mean"), n_seeds=("seed", "nunique"), unstable=("unstable", "mean"))
++         .reset_index().rename(columns={x: "x"}))
++    g.insert(0, "factor", factor)
++    return g
++
++
++def sens_reproducibility(runs: pd.DataFrame, lrs: dict, bs0: int) -> pd.DataFrame:
++    """Базовый sens-запуск (LR x1, batch bs0, weight decay по умолчанию) совпадает по конфигурации с main при том же seed:
++    F1 должны совпасть. Ненулевая разница - недетерминизм железа."""
++    s = runs[runs["phase"] == "sens"].copy()
++    m = runs[runs["phase"] == "main"].copy()
++    for c in ("lr", "batch_size", "weight_decay", "test_f1_main", "seed"):
++        s[c] = pd.to_numeric(s[c], errors="coerce")
++    m["seed"], m["f1_main"] = pd.to_numeric(m["seed"], errors="coerce"), pd.to_numeric(m["test_f1_main"], errors="coerce")
++    s = s[(s["lr"] / s["optimizer"].map(lrs)).round(6).eq(1.0) & (s["batch_size"] == bs0) & s["weight_decay"].isna()]
++    j = s.merge(m[["optimizer", "seed", "f1_main"]], on=["optimizer", "seed"])
++    j["f1_sens"] = j["test_f1_main"]
++    j["abs_diff"] = (j["f1_sens"] - j["f1_main"]).abs()
++    return j[["optimizer", "seed", "f1_main", "f1_sens", "abs_diff"]].sort_values(["optimizer", "seed"]).reset_index(drop=True)
++
++
++def sens_tables(runs: pd.DataFrame, lrs: dict, grid: dict, bs0: int) -> pd.DataFrame:
++    d = sens_tidy(runs, lrs, grid)
++    t = pd.concat([factor_table(d, f, bs0) for f in FACTORS], ignore_index=True)
++    t["rank"] = t.groupby(["factor", "x"])["f1"].rank(ascending=False, method="average")
++    return t
++
++
++def rank_stability(t: pd.DataFrame) -> pd.DataFrame:
++    """Насколько порядок оптимизаторов меняется между условиями: число разных победителей и средний Spearman между условиями."""
++    rows = []
++    for f, g in t.groupby("factor"):
++        pf = g.pivot(index="x", columns="optimizer", values="f1")
++        if pf.shape[1] < 2 or pf.shape[0] < 2:
++            continue
++        winners = pf.idxmax(axis=1)
++        rho = []
++        xs = list(pf.index)
++        with warnings.catch_warnings():
++            warnings.simplefilter("ignore")
++            for i in range(len(xs)):
++                for j in range(i + 1, len(xs)):
++                    r = float(sst.spearmanr(pf.loc[xs[i]], pf.loc[xs[j]])[0])
++                    if np.isfinite(r):
++                        rho.append(r)
++        rows.append({"factor": f, "n_conditions": len(xs), "n_distinct_winners": int(winners.nunique()),
++                     "winner_by_condition": "; ".join(f"{x:g}: {w}" for x, w in winners.items()),
++                     "mean_pairwise_spearman": float(np.mean(rho)) if rho else float("nan")})
++    return pd.DataFrame(rows)
++
++
++def plateau(x, y, delta: float) -> dict:
++    """Ширина плато: непрерывный участок вокруг максимума, где y >= max - delta; x - log10 LR (или множителя).
++
++    Границы уточняются линейной интерполяцией между соседними точками. Если плато упирается в край сетки,
++    ширина - нижняя оценка (left_censored / right_censored)."""
++    x, y = np.asarray(x, float), np.asarray(y, float)
++    order = np.argsort(x)
++    x, y = x[order], np.nan_to_num(y[order], nan=0.0)
++    i = int(np.argmax(y))
++    thr = y[i] - delta
++    lo = hi = i
++    while lo > 0 and y[lo - 1] >= thr:
++        lo -= 1
++    while hi < len(x) - 1 and y[hi + 1] >= thr:
++        hi += 1
++
++    def cross(a, b):    # a - точка ниже порога, b - выше
++        return x[a] + (thr - y[a]) * (x[b] - x[a]) / (y[b] - y[a])
++
++    xl = x[lo] if lo == 0 else cross(lo - 1, lo)
++    xr = x[hi] if hi == len(x) - 1 else cross(hi + 1, hi)
++    return {"best_x": float(x[i]), "best_y": float(y[i]), "x_lo": float(xl), "x_hi": float(xr), "width_decades": float(xr - xl),
++            "n_points": hi - lo + 1, "left_censored": lo == 0, "right_censored": hi == len(x) - 1}
++
++
++def plateau_table(t_lr: pd.DataFrame, value: str, log10_x: bool, deltas=DELTAS) -> pd.DataFrame:
++    """t_lr: колонки optimizer, x (LR или множитель), value. Плато считается отдельно для каждого оптимизатора и допуска."""
++    rows = []
++    for o, g in t_lr.groupby("optimizer"):
++        xs = np.log10(g["x"].to_numpy(float)) if log10_x else g["x"].to_numpy(float)
++        for dl in deltas:
++            rows.append({"optimizer": o, "delta": dl, **plateau(xs, g[value].to_numpy(float), dl)})
++    return pd.DataFrame(rows)
++
++
++# ------------------------------------------------------------------ bootstrap по документам / кластерам и LOCO
++def count_arrays(y, pred, unit_idx, n_units: int, n_classes: int = N_CLASSES) -> np.ndarray:
++    """Ошибки по единицам (документ или кластер): массив (3, U, C) = tp, fp, fn."""
++    y, pred, unit_idx = np.asarray(y), np.asarray(pred), np.asarray(unit_idx)
++    cnt = np.zeros((3, n_units, n_classes))
++    hit = y == pred
++    np.add.at(cnt[0], (unit_idx[hit], y[hit]), 1)
++    np.add.at(cnt[1], (unit_idx[~hit], pred[~hit]), 1)
++    np.add.at(cnt[2], (unit_idx[~hit], y[~hit]), 1)
++    return cnt
++
++
++def f1_from_weights(cnt: np.ndarray, w: np.ndarray) -> np.ndarray:
++    """Macro-F1 по классам, встречающимся в gold (как metrics.macro_f1), для набора весов единиц.
++
++    cnt: (3, U, C); w: (U,) или (B, U). Вес = сколько раз единица попала в выборку."""
++    tp, fp, fn = (w @ cnt[0]), (w @ cnt[1]), (w @ cnt[2])
++    den = 2 * tp + fp + fn
++    f = np.divide(2 * tp, den, out=np.zeros_like(den), where=den > 0)
++    present = (tp + fn) > 0
++    return (f * present).sum(-1) / np.maximum(present.sum(-1), 1)
++
++
++def bootstrap_units(cnt: dict, n_units: int, B: int = 2000, seed: int = 0) -> dict:
++    """Одна общая перевыборка единиц на всех оптимизаторов (так разности парные).
++
++    cnt[opt]: (S, 3, U, C) по seed обучения. Возвращает opt -> {"units": (B,), "units_seeds": (B,)}:
++    среднее по seed при фиксированных моделях и то же с перевыборкой seed внутри каждой реплики."""
++    rng = np.random.default_rng(seed)
++    W = rng.multinomial(n_units, np.full(n_units, 1.0 / n_units), size=B).astype(float)
++    n_seeds = {c.shape[0] for c in cnt.values()}
++    if len(n_seeds) != 1:
++        raise ValueError(f"Разное число seed у оптимизаторов: {sorted(n_seeds)}")
++    ns = n_seeds.pop()
++    pick = rng.integers(0, ns, size=(B, ns))
++    out = {}
++    for o, c in cnt.items():
++        F = np.stack([f1_from_weights(c[s], W) for s in range(ns)], axis=1)       # (B, S)
++        out[o] = {"units": F.mean(1), "units_seeds": np.take_along_axis(F, pick, 1).mean(1)}
++    return out
++
++
++def point_estimate(c: np.ndarray) -> float:
++    """Среднее по seed F1 на всех единицах (без перевыборки)."""
++    return float(np.mean([f1_from_weights(c[s], np.ones(c.shape[2])) for s in range(c.shape[0])]))
++
++
++def ci(x, alpha: float = 0.05) -> tuple[float, float]:
++    return float(np.quantile(x, alpha / 2)), float(np.quantile(x, 1 - alpha / 2))
++
++
++def paired_diffs(boot: dict, key: str = "units") -> pd.DataFrame:
++    """Разность средних F1 для каждой пары оптимизаторов по общим перевыборкам; p - двусторонняя доля реплик по разные стороны нуля."""
++    rows, opts = [], sorted(boot)
++    for i, a in enumerate(opts):
++        for b in opts[i + 1:]:
++            d = boot[a][key] - boot[b][key]
++            lo, hi = ci(d)
++            rows.append({"a": a, "b": b, "diff_mean": float(d.mean()), "ci_lo": lo, "ci_hi": hi,
++                         "p_boot": float(min(1.0, 2 * min((d <= 0).mean(), (d >= 0).mean())))})
++    return pd.DataFrame(rows)
++
++
++def loco(cnt: dict, unit_cluster: np.ndarray) -> pd.DataFrame:
++    """Leave-one-cluster-out на test: F1 на документах без кластера k (модели не переобучаются)."""
++    clusters = sorted(set(unit_cluster))
++    rows = []
++    for o, c in cnt.items():
++        full = point_estimate(c)
++        for k in clusters:
++            w = (unit_cluster != k).astype(float)
++            if w.sum() == 0:
++                continue
++            rest = float(np.mean([f1_from_weights(c[s], w) for s in range(c.shape[0])]))
++            only = float(np.mean([f1_from_weights(c[s], 1.0 - w) for s in range(c.shape[0])]))
++            rows.append({"optimizer": o, "left_out_cluster": k, "n_docs_left_out": int((unit_cluster == k).sum()),
++                         "f1_full": full, "f1_without": rest, "delta": rest - full, "f1_only_cluster": only})
++    t = pd.DataFrame(rows)
++    if len(t):
++        t["rank_without"] = t.groupby("left_out_cluster")["f1_without"].rank(ascending=False, method="min")
++    return t
++
++
++def check_against_runs(runs_f1: float, y, pred) -> float:
++    """Расхождение пересчитанного F1 с записанным в runs.csv: ловит неверный порядок строк или другие данные."""
++    return abs(macro_f1(y, pred) - float(runs_f1))
++
++
++def labels_of(df: pd.DataFrame) -> np.ndarray:
++    return df["label"].map(LABEL2ID).to_numpy()
++
++
++# ------------------------------------------------------------------ шум градиента (моменты собирает noise.py)
++def noise_scale(moments: dict) -> dict:
++    """Масштаб шума: E|g_B|^2 = |G|^2 + S/B (S - след ковариации градиента на один пример).
++
++    Оценка МНК по всем batch size и по паре (минимальный, максимальный). B_simple = S / |G|^2 (McCandlish и др., 2018):
++    при batch size заметно меньше B_simple шаг определяется шумом, заметно больше - сигналом."""
++    moments = {int(k): v for k, v in moments.items()}      # json хранит ключи строками
++    Bs = np.array(sorted(moments), float)
++    y = np.array([moments[int(b)]["mean_sq_norm"] for b in Bs])
++    X = np.column_stack([np.ones(len(Bs)), 1.0 / Bs])
++    G2, Sn = np.linalg.lstsq(X, y, rcond=None)[0]
++    B0, B1, y0, y1 = Bs[0], Bs[-1], y[0], y[-1]
++    G2p = (B1 * y1 - B0 * y0) / (B1 - B0)
++    Sp = (y0 - y1) / (1 / B0 - 1 / B1)
++    return {"G2_fit": float(G2), "S_fit": float(Sn), "B_simple_fit": float(Sn / G2) if G2 > 0 else float("nan"),
++            "G2_pair": float(G2p), "S_pair": float(Sp), "B_simple_pair": float(Sp / G2p) if G2p > 0 else float("nan")}
++
++
++def noise_rows(moments: dict) -> pd.DataFrame:
++    """По batch size: след ковариации, B*trace (должно быть ~константой), оценка сигнала без смещения и шум/сигнал."""
++    moments = {int(k): v for k, v in moments.items()}
++    rows = []
++    for b in sorted(moments):
++        m = moments[b]
++        signal = m["mean_norm_sq"] - m["trace_cov"] / m["n"]       # |mean|^2 смещён вверх на tr(Cov)/n
++        rows.append({"batch_size": b, "n_batches": m["n"], "trace_cov": m["trace_cov"], "trace_cov_x_B": m["trace_cov"] * b,
++                     "mean_sq_norm": m["mean_sq_norm"], "signal_sq_debiased": signal,
++                     "noise_to_signal": m["trace_cov"] / signal if signal > 0 else float("nan"),
++                     "cos_to_ref": m.get("cos_to_ref", float("nan")), "mean_loss": m.get("mean_loss", float("nan"))})
++    return pd.DataFrame(rows)
+diff --git a/src/vkr/lab4/train.py b/src/vkr/lab4/train.py
+index 96d68d3..6f1ee4a 100644
+--- a/src/vkr/lab4/train.py
++++ b/src/vkr/lab4/train.py
+@@ -15,7 +15,7 @@ from torch import nn
+ from .labels import LABEL2ID, N_CLASSES
+ from .metrics import ece, macro_f1
+ from .models import n_trainable
+-from .mutations import build_set, markov_frames
++from .mutations import build_set, markov_frames, scenario_test_sets
+ from .optimizers import make_optimizer
+ from .spec import RunSpec
+ 
+@@ -27,12 +27,7 @@ class Context:
+         self.cfg, self.splits, self.backend, self.device = cfg, splits, backend, device
+         t, mc, sc = cfg.protocol["train"], cfg.mutations, cfg.scenarios
+         self.val = build_set(splits["val"], sc["val_mutations"], "val", mc, mc["seeds"]["val"], t["copies_val"], keep_original=True)
+-        self.test_sets: dict[str, pd.DataFrame] = {}
+-        for name, s in sc["scenarios"].items():
+-            if "mutations" in s:
+-                copies = 1 if name == "S0" else t["copies_test"]
+-                self.test_sets[name] = build_set(splits["test"], s["mutations"], "test", mc, mc["seeds"]["test"], copies,
+-                                                 keep_original=(name == "S0"))
++        self.test_sets: dict[str, pd.DataFrame] = scenario_test_sets(sc, mc, t["copies_test"], splits["test"])
+         self.markov = list(markov_frames(splits["test"], sc["scenarios"]["S5"], mc, mc["seeds"]["test"])) \
+             if "S5" in sc["scenarios"] else []
+ 
+@@ -80,7 +75,9 @@ def _sync(device: str):
+ 
+ 
+ def train_run(spec: RunSpec, ctx: Context, log_dir: Path | None = None, eval_scenarios: bool = True,
+-              save_probs_dir: Path | None = None) -> dict:
++              save_probs_dir: Path | None = None, step_hook=None) -> dict:
++    """step_hook(done_steps, model) -> bool вызывается после каждого шага; True останавливает обучение (используется для
++    замера шума градиента на чекпоинте). Время хука не входит в train_time_s. Без хука поведение прежнее."""
+     cfg, backend, device = ctx.cfg, ctx.backend, ctx.device
+     tcfg = cfg.protocol["train"]
+     steps = spec.steps or tcfg["steps"]
+@@ -156,6 +153,15 @@ def train_run(spec: RunSpec, ctx: Context, log_dir: Path | None = None, eval_sce
+             log.append({"step": done_steps, "val_f1": f1})
+             if steps_to_target is None and f1 >= target:
+                 steps_to_target = done_steps
++        if step_hook is not None:
++            _sync(device)
++            t0 = time.perf_counter()
++            stop = step_hook(done_steps, model)
++            _sync(device)
++            eval_time += time.perf_counter() - t0
++            if stop:
++                reason = reason or "stopped_by_hook"
++                break
+         if (time.perf_counter() - t_start - eval_time) / 60 > tcfg["time_limit_min"]:
+             reason = reason or "time_limit"
+             break
+diff --git a/tests/test_stochastic.py b/tests/test_stochastic.py
+new file mode 100644
+index 0000000..65d56f9
+--- /dev/null
++++ b/tests/test_stochastic.py
+@@ -0,0 +1,193 @@
++"""Этап 7 без torch: плато, bootstrap по документам, LOCO, оценка шума, sensitivity-таблицы, сборка отчёта на демо-данных."""
++import json
++
++import numpy as np
++import pandas as pd
++import pytest
++
++from vkr.lab4 import stochastic as X
++from vkr.lab4.config import Config
++from vkr.lab4.data import load_observations, split_frames
++from vkr.lab4.demo_data import make_demo
++from vkr.lab4.labels import LABEL2ID, N_CLASSES
++from vkr.lab4.metrics import macro_f1
++from vkr.lab4.mutations import build_set
++from vkr.lab4.optimizers import OPTIMIZERS
++
++
++def test_plateau_interpolates_and_flags_edges():
++    x, y = [-2, -1, 0, 1, 2], [0.0, 0.5, 0.9, 0.95, 0.2]
++    p = X.plateau(x, y, 0.1)                       # порог 0,85: точки 0 и 1
++    assert p["best_x"] == 1 and p["n_points"] == 2 and not p["left_censored"] and not p["right_censored"]
++    assert p["x_lo"] == pytest.approx(-1 + (0.85 - 0.5) / (0.9 - 0.5))
++    assert p["x_hi"] == pytest.approx(1 + (0.95 - 0.85) / (0.95 - 0.2))
++    q = X.plateau([0, 1, 2], [0.9, 0.9, 0.9], 0.01)
++    assert q["left_censored"] and q["right_censored"] and q["width_decades"] == 2
++
++
++def _rand_preds(rng, n=300, n_docs=20):
++    y = rng.integers(0, N_CLASSES, n)
++    pred = np.where(rng.random(n) < 0.7, y, rng.integers(0, N_CLASSES, n))
++    doc = np.sort(rng.integers(0, n_docs, n))
++    return y, pred, doc
++
++
++def test_f1_from_weights_matches_macro_f1():
++    rng = np.random.default_rng(0)
++    y, pred, doc = _rand_preds(rng)
++    cnt = X.count_arrays(y, pred, doc, 20)
++    assert X.f1_from_weights(cnt, np.ones(20)) == pytest.approx(macro_f1(y, pred))
++    w = rng.multinomial(20, np.full(20, 0.05)).astype(float)
++    rows = np.repeat(np.arange(len(y)), w[doc].astype(int))
++    assert X.f1_from_weights(cnt, w) == pytest.approx(macro_f1(y[rows], pred[rows]))
++
++
++def test_bootstrap_shared_resamples_and_ci():
++    rng = np.random.default_rng(1)
++    y, pa, doc = _rand_preds(rng)
++    pb = np.where(rng.random(len(y)) < 0.4, y, rng.integers(0, N_CLASSES, len(y)))      # заметно хуже
++    cnt = {"a": np.stack([X.count_arrays(y, pa, doc, 20)] * 3), "b": np.stack([X.count_arrays(y, pb, doc, 20)] * 3)}
++    boot = X.bootstrap_units(cnt, 20, B=500, seed=3)
++    lo, hi = X.ci(boot["a"]["units"])
++    assert lo < X.point_estimate(cnt["a"]) < hi
++    d = X.paired_diffs(boot)
++    assert d.loc[0, "diff_mean"] > 0 and d.loc[0, "p_boot"] < 0.05
++    assert boot["a"]["units"].shape == (500,)
++
++
++def test_loco_equals_filtered_f1():
++    rng = np.random.default_rng(2)
++    y, pred, doc = _rand_preds(rng)
++    cluster = np.arange(20) % 4
++    t = X.loco({"a": X.count_arrays(y, pred, doc, 20)[None]}, cluster)
++    row = t[t["left_out_cluster"] == 1].iloc[0]
++    keep = cluster[doc] != 1
++    assert row["f1_without"] == pytest.approx(macro_f1(y[keep], pred[keep]))
++    assert row["n_docs_left_out"] == 5
++
++
++def test_noise_scale_recovers_parameters():
++    G2, S = 0.5, 40.0
++    mom = {str(B): {"n": 200, "mean_sq_norm": G2 + S / B, "mean_norm_sq": G2 + S / B / 200 * 1.0, "trace_cov": S / B} for B in (16, 32, 64, 128)}
++    r = X.noise_scale(mom)
++    assert r["G2_fit"] == pytest.approx(G2) and r["S_fit"] == pytest.approx(S) and r["B_simple_fit"] == pytest.approx(80)
++    assert r["B_simple_pair"] == pytest.approx(80)
++    rows = X.noise_rows(mom)
++    assert rows["trace_cov_x_B"].nunique() == 1 or np.allclose(rows["trace_cov_x_B"], S)
++
++
++def _sens_runs(lrs, bs0=64):
++    rows = []
++    quality = {"adam": 0.80, "rmsprop": 0.78, "sgd": 0.70}
++    for o, q in quality.items():
++        for s in (0, 1):
++            def add(mult=1.0, bs=bs0, wd=None, f1=q):
++                rows.append({"run_id": f"sens-{o}-{mult}-{bs}-{wd}-{s}", "phase": "sens", "optimizer": o, "lr": lrs[o] * mult, "seed": s,
++                             "batch_size": bs, "weight_decay": wd if wd is not None else np.nan, "val_f1_final": f1 + 0.1,
++                             "test_f1_main": f1, "unstable": 0})
++            for m, drop in ((0.1, 0.2), (0.333, 0.05), (1.0, 0.0), (3.0, 0.03), (10.0, 0.7)):
++                add(mult=m, f1=q - drop + 0.01 * s)
++            add(bs=32, f1=q + 0.01)
++            add(bs=128, f1=q - 0.01)
++            add(wd=0.0, f1=q)
++            add(wd=1e-4, f1=q - 0.005)
++    return pd.DataFrame(rows)
++
++
++def test_sens_tables_ranks_and_plateau():
++    cfg = Config()
++    lrs = {"adam": 1e-3, "rmsprop": 3e-4, "sgd": 0.3}
++    t = X.sens_tables(_sens_runs(lrs), lrs, cfg.grid, 64)
++    assert set(t["factor"]) == {"lr", "bs", "wd"}
++    lr = t[t["factor"] == "lr"]
++    assert sorted(lr["x"].unique()) == [0.1, 0.333, 1.0, 3.0, 10.0]
++    base = lr[(lr["x"] == 1.0)].set_index("optimizer")["rank"]
++    assert base["adam"] == 1 and base["sgd"] == 3
++    st = X.rank_stability(t)
++    assert (st["n_distinct_winners"] == 1).all()
++    pt = X.plateau_table(lr, "f1", True, deltas=(0.06,))
++    adam = pt[pt["optimizer"] == "adam"].iloc[0]
++    assert adam["best_x"] == pytest.approx(0.0, abs=1e-6) and adam["n_points"] >= 3 and adam["width_decades"] > 0.5
++
++
++def test_adamw_default_wd_is_effective_value():
++    cfg = Config()
++    r = pd.DataFrame([{"run_id": "a", "phase": "sens", "optimizer": "adamw", "lr": 1e-3, "seed": 0, "batch_size": 64, "weight_decay": np.nan,
++                       "val_f1_final": 0.9, "test_f1_main": 0.8, "unstable": 0}])
++    d = X.sens_tidy(r, {"adamw": 1e-3}, cfg.grid)
++    assert d.loc[0, "wd"] == 0.01 and d.loc[0, "wd_is_base"]
++
++
++def test_report_end_to_end_on_demo_data(tmp_path):
++    from vkr.lab4.stoch_report import build_stoch_report
++    cfg = Config()
++    cfg.protocol["paths"]["results"] = str(tmp_path / "res")
++    cfg.protocol["data"]["dir"] = str(make_demo(tmp_path / "demo"))
++    cfg.protocol["train"]["eval_seeds"] = [0, 1, 2]
++    df = load_observations(cfg.protocol["data"]["dir"])
++    test = split_frames(df)["test"]
++    t, mc, sc = cfg.protocol["train"], cfg.mutations, cfg.scenarios
++    sets = {n: build_set(test, s["mutations"], "test", mc, mc["seeds"]["test"], 1 if n == "S0" else t["copies_test"], keep_original=(n == "S0"))
++            for n, s in sc["scenarios"].items() if "mutations" in s and n in X.SAVED_SCENARIOS}
++    rng = np.random.default_rng(0)
++    pdir = cfg.results_dir / "probs"
++    pdir.mkdir(parents=True)
++    lrs, rows = {}, []
++    for k, o in enumerate(OPTIMIZERS):
++        lrs[o] = 1e-3
++        for s in range(3):
++            rid = f"main-{o}-lr0.001-bs64-wddef-s{s}"
++            row = {"run_id": rid, "phase": "main", "optimizer": o, "seed": s, "lr": 1e-3, "batch_size": 64, "steps_to_target": 40 + 5 * k,
++                   "unstable": 0, "train_time_s": 70, "peak_mem_mb": 4000, "val_f1_final": 0.9}
++            out = {}
++            for n, d in sets.items():
++                y = d["label"].map(LABEL2ID).to_numpy()
++                P = rng.random((len(d), N_CLASSES)) * 0.2
++                ok = rng.random(len(d)) < (0.9 - 0.02 * k)
++                P[np.arange(len(d)), np.where(ok, y, rng.integers(0, N_CLASSES, len(d)))] += 1.0
++                out[n] = P.astype(np.float32)
++                row[f"test_f1_{n}"] = macro_f1(y, P.argmax(1))
++                row[f"test_ece_{n}"] = 0.05
++            row["test_f1_main"], row["test_ece_main"] = row["test_f1_MAIN"], 0.05
++            np.savez_compressed(pdir / f"{rid}.npz", **out)
++            rows.append(row)
++    runs = pd.DataFrame(rows)
++    nd = cfg.results_dir / "noise"
++    nd.mkdir(parents=True)
++    mom = {str(B): {"n": 50, "mean_sq_norm": 0.5 + 40 / B, "mean_norm_sq": 0.51, "trace_cov": 40 / B, "mean_loss": 1.0, "cos_to_ref": 0.9} for B in (16, 32, 64, 128)}
++    (nd / "noise_adam_s0.json").write_text(json.dumps({"optimizer": "adam", "seed": 0, "lr": 1e-3, "checkpoint_step": 40, "n_batches": 50, "moments": mom}))
++    p = build_stoch_report(cfg, runs, None, 200)
++    text = p.read_text(encoding="utf-8")
++    out = cfg.results_dir / "stochastic"
++    assert "Bootstrap по документам" in text and "Карта источников случайности" in text and "B_simple" in text
++    assert "расходится" not in text and "анализ пропущен" not in text.lower()
++    assert (out / "bootstrap_ci.csv").exists() and (out / "noise_scale.csv").exists() and (out / "bootstrap_ci.png").exists()
++    bt = pd.read_csv(out / "bootstrap_ci.csv", encoding="utf-8-sig")
++    assert ((bt["ci_lo"] <= bt["f1"]) & (bt["f1"] <= bt["ci_hi"])).all()
++
++
++def test_sens_reproducibility_pairs_base_run_with_main():
++    lrs = {"adam": 1e-3, "sgd": 0.3}
++    rows = []
++    for o in lrs:
++        for s in (0, 1):
++            rows.append({"run_id": f"m{o}{s}", "phase": "main", "optimizer": o, "lr": lrs[o], "seed": s, "batch_size": 64,
++                         "weight_decay": np.nan, "test_f1_main": 0.8 + s / 100, "unstable": 0})
++            rows.append({"run_id": f"b{o}{s}", "phase": "sens", "optimizer": o, "lr": lrs[o], "seed": s, "batch_size": 64,
++                         "weight_decay": np.nan, "test_f1_main": 0.8 + s / 100 + (0.003 if o == "sgd" else 0), "unstable": 0})
++            rows.append({"run_id": f"x{o}{s}", "phase": "sens", "optimizer": o, "lr": lrs[o] * 3, "seed": s, "batch_size": 64,
++                         "weight_decay": np.nan, "test_f1_main": 0.5, "unstable": 0})     # не базовый: не должен попасть
++    rep = X.sens_reproducibility(pd.DataFrame(rows), lrs, 64)
++    assert len(rep) == 4
++    assert rep[rep.optimizer == "adam"]["abs_diff"].max() < 1e-12
++    assert rep[rep.optimizer == "sgd"]["abs_diff"].max() == pytest.approx(0.003)
++
++
++def test_scenario_test_sets_match_context_logic(splits):
++    from vkr.lab4.mutations import scenario_test_sets
++    cfg = Config()
++    sets = scenario_test_sets(cfg.scenarios, cfg.mutations, 2, splits["test"])
++    assert set(sets) == {"S0", "S1", "S2", "S3", "S4", "MAIN"}          # S5 строится отдельно (цепь Маркова)
++    mc = cfg.mutations
++    manual = build_set(splits["test"], cfg.scenarios["scenarios"]["MAIN"]["mutations"], "test", mc, mc["seeds"]["test"], 2, keep_original=False)
++    assert sets["MAIN"].equals(manual) and len(sets["S0"]) == len(splits["test"])
+diff --git a/tests/test_torch_smoke.py b/tests/test_torch_smoke.py
+index 9dc9524..acd77ad 100644
+--- a/tests/test_torch_smoke.py
++++ b/tests/test_torch_smoke.py
+@@ -39,3 +39,25 @@ def test_same_seed_is_reproducible(ctx):
+ def test_diverging_run_is_flagged(ctx):
+     row = train_run(RunSpec("pilot", "sgd", 1e6, 0), ctx, None, eval_scenarios=False)
+     assert row["unstable"] == 1
++
++
++def test_step_hook_stops_training(ctx):
++    calls = []
++    row = train_run(RunSpec("noise", "adam", 1e-3, 0), ctx, None, eval_scenarios=False,
++                    step_hook=lambda step, model: (calls.append(step), step == 20)[1])
++    assert row["steps_done"] == 20 and calls[-1] == 20 and calls[0] == 1
++
++
++def test_gradient_noise_decreases_with_batch(ctx):
++    import numpy as np
++
++    from vkr.lab4.noise import collect_moments
++    from vkr.lab4.train import _labels
++    tr, backend = ctx.train_set(0), ctx.backend
++    items = [backend.encode_one(h, v) for h, v in zip(tr["header_text"], tr["values_sample"])]
++    y = torch.tensor(_labels(tr), dtype=torch.long)
++    model = backend.build_model(0)
++    params = [p for p in model.parameters() if p.requires_grad]
++    m = collect_moments(model, backend, items, y, params, [8, 32], 30, 32, "cpu", np.random.default_rng(0), log=lambda *a: None)
++    assert m[8]["trace_cov"] > m[32]["trace_cov"] > 0
++    assert abs(m[32]["cos_to_ref"] - 1.0) < 1e-5 and m[8]["n"] == 30

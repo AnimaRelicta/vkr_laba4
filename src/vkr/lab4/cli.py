@@ -172,8 +172,14 @@ def cmd_smoke(args):
     opts = top_for_sensitivity(cfg)
     print("sensitivity для:", opts)
     execute(sens_specs(cfg, opts), ctx, eval_scenarios=True)
+    print("== noise")
+    from .noise import run_noise
+    run_noise(cfg, ctx, ["adam", "sgd"], [0])
     print("== stats")
     print("Отчёт:", build_report(cfg, read_runs(cfg)))
+    print("== stoch")
+    from .stoch_report import build_stoch_report
+    print("Отчёт:", build_stoch_report(cfg, read_runs(cfg), None, 200))
     print(f"SMOKE OK. Результаты проверки лежат в {cfg.results_dir} (в основные results/ не попадают, можно удалить).")
 
 
@@ -215,6 +221,20 @@ def cmd_sens(args):
     opts = top_for_sensitivity(cfg)
     print("Sensitivity для:", opts)
     execute(sens_specs(cfg, opts), _context(cfg), eval_scenarios=True)
+
+
+def cmd_noise(args):
+    from .noise import run_noise
+    cfg = _cfg(args)
+    check_lock()
+    run_noise(cfg, _context(cfg), args.optimizers, args.seeds, args.n_batches)
+
+
+def cmd_stoch(args):
+    from .runner import read_runs
+    from .stoch_report import build_stoch_report
+    cfg = _cfg(args)
+    print("Отчёт:", build_stoch_report(cfg, read_runs(cfg), args.only, args.bootstrap))
 
 
 def cmd_stats(args):
@@ -266,7 +286,14 @@ def main(argv=None):
     add("tune", cmd_tune, "этап 4: подбор LR (8 x 7 x 2 запуска)")
     add("select-lr", cmd_select_lr, "выбрать LR по результатам tune")
     add("main", cmd_main, "этап 5: 8 оптимизаторов x 10 seed + сценарии S0-S5")
-    add("sens", cmd_sens, "этап 7: sensitivity (LR, batch size, weight decay)")
+    add("sens", cmd_sens, "этап 7: запуски sensitivity (LR, batch size, weight decay)")
+    p = add("noise", cmd_noise, "этап 7: шум градиента на чекпоинте (нужен torch и GPU)")
+    p.add_argument("--optimizers", nargs="*", help="по умолчанию: финалисты (топ-3 по баллу) + sgd")
+    p.add_argument("--seeds", type=int, nargs="*", default=[0])
+    p.add_argument("--n-batches", type=int, default=0, help="только для проверки: переопределить grid.yaml (отступление нужно отметить в отчёте)")
+    p = add("stoch", cmd_stoch, "этап 7: sensitivity-таблицы, плато, bootstrap по документам, LOCO, шум, карта случайности (без torch)")
+    p.add_argument("--only", nargs="*", choices=["sens", "noise", "robust", "map"], help="только эти разделы")
+    p.add_argument("--bootstrap", type=int, default=2000, help="число перевыборок")
     add("stats", cmd_stats, "этап 6: статистика, сводный балл, гипотезы, графики")
     add("status", cmd_status, "сколько запусков выполнено")
     args = ap.parse_args(argv)
