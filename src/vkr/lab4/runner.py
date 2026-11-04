@@ -76,7 +76,7 @@ def execute(specs: list[RunSpec], ctx, eval_scenarios: bool, save_probs: bool = 
 def pilot_specs(cfg, seed: int = 0) -> list[RunSpec]:
     """8 оптимизаторов, один seed, LR из середины сетки (4-я из 7 точек)."""
     bs = cfg.protocol["train"]["batch_size"]
-    return [RunSpec("pilot", o, lr_grid(cfg.grid, o)[3], seed, bs) for o in OPTIMIZERS]
+    return [RunSpec("pilot", o, lr_grid(cfg.grid, o)[min(3, len(lr_grid(cfg.grid, o)) - 1)], seed, bs) for o in OPTIMIZERS]
 
 
 def tune_specs(cfg) -> list[RunSpec]:
@@ -109,14 +109,14 @@ def load_selected_lr(cfg) -> dict:
     return json.loads(p.read_text(encoding="utf-8"))
 
 
-def main_specs(cfg) -> list[RunSpec]:
-    t, lrs = cfg.protocol["train"], load_selected_lr(cfg)
+def main_specs(cfg, lrs: dict | None = None) -> list[RunSpec]:
+    t, lrs = cfg.protocol["train"], lrs or load_selected_lr(cfg)
     return [RunSpec("main", o, lrs[o], s, t["batch_size"]) for o in OPTIMIZERS for s in t["eval_seeds"]]
 
 
-def sens_specs(cfg, optimizers: list[str]) -> list[RunSpec]:
-    """Один фактор за раз: LR x{0.1, 1/3, 1, 3, 10}, batch size, weight decay; 5 seed."""
-    t, g, lrs = cfg.protocol["train"], cfg.grid["sensitivity"], load_selected_lr(cfg)
+def sens_specs(cfg, optimizers: list[str], lrs: dict | None = None) -> list[RunSpec]:
+    """Один фактор за раз: LR x{0.1, 1/3, 1, 3, 10}, batch size, weight decay. Значения, равные базовым, не дублируются."""
+    t, g, lrs = cfg.protocol["train"], cfg.grid["sensitivity"], lrs or load_selected_lr(cfg)
     specs: dict[str, RunSpec] = {}
     for o in optimizers:
         for s in t["sens_seeds"]:
@@ -127,7 +127,8 @@ def sens_specs(cfg, optimizers: list[str]) -> list[RunSpec]:
                 sp = RunSpec("sens", o, lrs[o], s, bs)
                 specs[sp.run_id] = sp
             for wd in g["weight_decays"]:
-                sp = RunSpec("sens", o, lrs[o], s, t["batch_size"], weight_decay=wd)
+                base_wd = cfg.grid["optimizers"][o].get("weight_decay", 0.0)
+                sp = RunSpec("sens", o, lrs[o], s, t["batch_size"], weight_decay=None if wd == base_wd else wd)
                 specs[sp.run_id] = sp
     return list(specs.values())
 

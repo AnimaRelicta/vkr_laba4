@@ -48,7 +48,10 @@ uv run lab4 passport
 uv run lab4 check-data --dir data/lab1/out --dir data/lab1/out_hard --llm-dir data/lab1/llm_out_hard
 
 # замер скорости на вашей карте и оценка времени всех этапов
-uv run lab4 bench --steps 30 --plan-steps 600
+uv run lab4 bench --steps 30 --micro 8 16 24   # выберет micro_batch и оценит часы по реальным планам
+
+# тестовый прогон ВСЕГО конвейера на уменьшенном протоколе (минуты), результаты в results_smoke/
+uv run lab4 smoke
 
 # этап 3: пилот (8 оптимизаторов, seed 0), затем заморозить число шагов и целевой F1
 uv run lab4 pilot

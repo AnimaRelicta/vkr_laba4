@@ -1,0 +1,108 @@
+diff --git a/README.md b/README.md
+index 31a3304..7814d81 100644
+--- a/README.md
++++ b/README.md
+@@ -48,7 +48,7 @@ uv run lab4 passport
+ uv run lab4 check-data --dir data/lab1/out --dir data/lab1/out_hard --llm-dir data/lab1/llm_out_hard
+ 
+ # замер скорости на вашей карте и оценка времени всех этапов
+-uv run lab4 bench --steps 30 --micro 16 32 64   # выберет micro_batch и оценит часы по реальным планам
++uv run lab4 bench --steps 30 --micro 8 16 24   # выберет micro_batch и оценит часы по реальным планам
+ 
+ # тестовый прогон ВСЕГО конвейера на уменьшенном протоколе (минуты), результаты в results_smoke/
+ uv run lab4 smoke
+diff --git a/TODO.md b/TODO.md
+index 0dae1a4..ae404de 100644
+--- a/TODO.md
++++ b/TODO.md
+@@ -35,7 +35,7 @@
+ ## Этап 3. Модель и пилот (1 день)
+ 
+ - [~] Qwen3-0.6B + LoRA и компактная n-gram модель, 8 оптимизаторов, общий цикл обучения (`train.py`). **Torch-код не запускался в среде разработки (нет GPU и доступа к PyPI/HF); первым делом `uv run pytest` и `uv run lab4 bench`**
+-- [~] Бюджет урезан (шаг 2): 120 шагов, tune 56, main 40, sens 81; запустить `uv run lab4 smoke`, затем `uv run lab4 bench --micro 16 32 64`, записать с/шаг, micro_batch и часы в PROTOCOL.md раздел 9
++- [~] Бюджет урезан (шаг 2): 120 шагов, tune 56, main 40, sens 81; запустить `uv run lab4 smoke`, затем `uv run lab4 bench --micro 8 16 24`, записать с/шаг, micro_batch и часы в PROTOCOL.md раздел 9
+ - [ ] `uv run lab4 pilot` -> выбрать число шагов и целевой F1 -> `uv run lab4 freeze --steps N --target F`
+ 
+ ## Этап 4. Настройка LR (1 день)
+diff --git a/configs/protocol.yaml b/configs/protocol.yaml
+index abf99a5..0ba4712 100644
+--- a/configs/protocol.yaml
++++ b/configs/protocol.yaml
+@@ -13,7 +13,8 @@ model:
+     lora_dropout: 0.05
+     lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+     max_len: 64
+-    micro_batch: 32           # градиентная аккумуляция: эффективный batch = train.batch_size; выбрать по `lab4 bench --micro 16 32 64`
++    micro_batch: 16           # градиентная аккумуляция: эффективный batch = train.batch_size. 32 не влезает в 8 ГБ RTX 4060 (уходит в общую память, всё замедляется): менять только после `lab4 bench`
++    eval_batch: 64            # батч при оценке (val/test): меньше пик памяти
+     head_dropout: 0.2
+     base_dtype: bfloat16      # база заморожена; LoRA-адаптеры и голова обучаются в FP32
+   ngram:
+diff --git a/src/vkr/lab4/cli.py b/src/vkr/lab4/cli.py
+index c9f3b2f..9622654 100644
+--- a/src/vkr/lab4/cli.py
++++ b/src/vkr/lab4/cli.py
+@@ -89,6 +89,7 @@ def cmd_bench(args):
+     import time
+ 
+     import numpy as np
++    import torch
+ 
+     from .budget import plan_cost
+     from .spec import RunSpec
+@@ -106,7 +107,8 @@ def cmd_bench(args):
+         L = np.array([len(be.encode_one(h, v)) for h, v in zip(tr["header_text"], tr["values_sample"])])
+         print(f"Длина входа, токенов: среднее {L.mean():.1f}, p95 {np.percentile(L, 95):.0f}, макс {L.max()}; "
+               f"обрезано по max_len={be.q['max_len']}: {100 * (L >= be.q['max_len']).mean():.1f} %")
+-    micros = args.micro or [be.micro_batch]
++    micros = sorted(args.micro or ([8, 16, 24] if be.name == "qwen" else [be.micro_batch]), key=lambda x: (x is None, x))
++    vram = torch.cuda.get_device_properties(0).total_memory if ctx.device == "cuda" else 0
+     train_run(RunSpec("bench", "adamw", 1e-3, 0, steps=3), ctx, None, eval_scenarios=False)     # прогрев CUDA
+     res = []
+     for m in micros:
+@@ -123,9 +125,15 @@ def cmd_bench(args):
+             continue
+         dt = time.perf_counter() - t0
+         per, over = row["train_time_s"] / max(1, row["steps_done"]), dt - row["train_time_s"]
++        reserved = torch.cuda.max_memory_reserved() if vram else 0
++        too_big = bool(vram) and reserved > 0.85 * vram      # Windows (WDDM) при нехватке уводит память в общую (RAM) и всё замедляется
++        print(f"micro_batch={m}: {per:.3f} с/шаг, пик памяти {row['peak_mem_mb']:.0f} МБ"
++              + (f", зарезервировано {reserved / 2**20:.0f} из {vram / 2**20:.0f} МБ" if vram else "")
++              + f", обучаемых параметров {row['n_trainable']:,}, накладные расходы на запуск {over:.1f} с"
++              + ("  <- СЛИШКОМ БЛИЗКО К ЛИМИТУ ПАМЯТИ, не использовать" if too_big else ""))
++        if too_big:
++            break                                            # большие micro_batch заведомо хуже
+         res.append((per, over, m))
+-        print(f"micro_batch={m}: {per:.3f} с/шаг, пик памяти {row['peak_mem_mb']:.0f} МБ, "
+-              f"обучаемых параметров {row['n_trainable']:,}, накладные расходы на запуск {over:.1f} с (сборка модели + оценки)")
+     if not res:
+         raise SystemExit("Ни один вариант не отработал")
+     per, over, m = min(res)
+diff --git a/src/vkr/lab4/models.py b/src/vkr/lab4/models.py
+index 58ec559..5f04099 100644
+--- a/src/vkr/lab4/models.py
++++ b/src/vkr/lab4/models.py
+@@ -98,6 +98,7 @@ class QwenBackend:
+ 
+         self.q = cfg["model"]["qwen"]
+         self.micro_batch = self.q.get("micro_batch", 16)
++        self.eval_bs = self.q.get("eval_batch", 64)
+         self.tok = AutoTokenizer.from_pretrained(self.q["name"])
+         self._base = None                      # чистая база Qwen: читается с диска один раз, в каждый запуск идёт копия
+         self.pad_id = self.tok.pad_token_id if self.tok.pad_token_id is not None else 0
+diff --git a/src/vkr/lab4/train.py b/src/vkr/lab4/train.py
+index 457badd..7ccaae2 100644
+--- a/src/vkr/lab4/train.py
++++ b/src/vkr/lab4/train.py
+@@ -47,9 +47,10 @@ def _labels(df: pd.DataFrame) -> np.ndarray:
+ 
+ 
+ @torch.no_grad()
+-def predict_probs(model, backend, df: pd.DataFrame, device, cache: dict | None = None, bs: int = 256) -> np.ndarray:
++def predict_probs(model, backend, df: pd.DataFrame, device, cache: dict | None = None, bs: int | None = None) -> np.ndarray:
+     """Вероятности классов; одинаковые (заголовок, значения) считаются один раз."""
+     model.eval()
++    bs = bs or getattr(backend, "eval_bs", 256)
+     keys = list(zip(df["header_text"], df["values_sample"]))
+     cache = {} if cache is None else cache
+     todo = [k for k in dict.fromkeys(keys) if k not in cache]

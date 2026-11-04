@@ -85,27 +85,96 @@ def cmd_freeze(args):
 
 
 def cmd_bench(args):
+    """Замер скорости: прогрев, затем один запуск на каждый micro_batch (с оценками), оценка часов по реальным планам запусков."""
     import time
 
+    import numpy as np
     import torch
 
-    from .optimizers import OPTIMIZERS
-    cfg = _cfg(args)
-    ctx = _context(cfg)
-    n, plan_default = args.steps, cfg.protocol["train"]["steps"]
-    cfg.protocol["train"].update({"steps": n, "eval_every": 10**9, "target_val_f1": 2.0})
+    from .budget import plan_cost
     from .spec import RunSpec
     from .train import train_run
+
+    cfg = _cfg(args)
+    ctx = _context(cfg)
+    t = cfg.protocol["train"]
+    plan_steps, n = args.plan_steps or t["steps"], args.steps
+    evals = max(1, plan_steps // t["eval_every"])          # столько же оценок на val, сколько в настоящем запуске
+    t.update({"steps": n, "eval_every": max(1, n // evals), "target_val_f1": 2.0})
+    be = ctx.backend
+    if be.name == "qwen":
+        tr = ctx.splits["train"]
+        L = np.array([len(be.encode_one(h, v)) for h, v in zip(tr["header_text"], tr["values_sample"])])
+        print(f"Длина входа, токенов: среднее {L.mean():.1f}, p95 {np.percentile(L, 95):.0f}, макс {L.max()}; "
+              f"обрезано по max_len={be.q['max_len']}: {100 * (L >= be.q['max_len']).mean():.1f} %")
+    micros = sorted(args.micro or ([8, 16, 24] if be.name == "qwen" else [be.micro_batch]), key=lambda x: (x is None, x))
+    vram = torch.cuda.get_device_properties(0).total_memory if ctx.device == "cuda" else 0
+    train_run(RunSpec("bench", "adamw", 1e-3, 0, steps=3), ctx, None, eval_scenarios=False)     # прогрев CUDA
+    res = []
+    for m in micros:
+        be.micro_batch = m
+        t0 = time.perf_counter()
+        try:
+            row = train_run(RunSpec("bench", "adamw", 1e-3, 0, steps=n), ctx, None, eval_scenarios=True)
+        except RuntimeError as e:
+            if "out of memory" not in str(e).lower():
+                raise
+            import torch
+            torch.cuda.empty_cache()
+            print(f"micro_batch={m}: не хватило памяти")
+            continue
+        dt = time.perf_counter() - t0
+        per, over = row["train_time_s"] / max(1, row["steps_done"]), dt - row["train_time_s"]
+        reserved = torch.cuda.max_memory_reserved() if vram else 0
+        too_big = bool(vram) and reserved > 0.85 * vram      # Windows (WDDM) при нехватке уводит память в общую (RAM) и всё замедляется
+        print(f"micro_batch={m}: {per:.3f} с/шаг, пик памяти {row['peak_mem_mb']:.0f} МБ"
+              + (f", зарезервировано {reserved / 2**20:.0f} из {vram / 2**20:.0f} МБ" if vram else "")
+              + f", обучаемых параметров {row['n_trainable']:,}, накладные расходы на запуск {over:.1f} с"
+              + ("  <- СЛИШКОМ БЛИЗКО К ЛИМИТУ ПАМЯТИ, не использовать" if too_big else ""))
+        if too_big:
+            break                                            # большие micro_batch заведомо хуже
+        res.append((per, over, m))
+    if not res:
+        raise SystemExit("Ни один вариант не отработал")
+    per, over, m = min(res)
+    be.micro_batch = m
+    t["steps"] = plan_steps
+    print(f"\nЛучший micro_batch: {m}. Впишите его в configs/protocol.yaml (model.qwen.micro_batch).")
     t0 = time.perf_counter()
     row = train_run(RunSpec("bench", "adamw", 1e-3, 0, steps=n), ctx, None, eval_scenarios=False)
-    dt = time.perf_counter() - t0
-    per = row["train_time_s"] / max(1, row["steps_done"])
-    t = cfg.protocol["train"]
-    plan = {"tuning (112)": len(OPTIMIZERS) * 7 * len(t["tuning_seeds"]), "main (80)": len(OPTIMIZERS) * len(t["eval_seeds"]), "sensitivity (~180)": 180}
-    print(f"{per:.3f} с/шаг, пиковая память {row['peak_mem_mb']:.0f} МБ, обучаемых параметров {row['n_trainable']:,} (всего {dt:.1f} с на {n} шагов)")
-    steps = args.plan_steps or plan_default
-    for k, v in plan.items():
-        print(f"  {k}: {v} запусков x {steps} шагов ≈ {v * steps * per / 3600:.1f} ч (без оценки на val/test)")
+    over_tune = max(0.0, time.perf_counter() - t0 - row["train_time_s"])
+    print(f"накладные расходы на запуск: с оценкой сценариев {over:.1f} с (main, sens), без неё {over_tune:.1f} с (pilot, tune)")
+    cost = plan_cost(cfg, per, {"pilot": over_tune, "tune": over_tune, "main": over, "sens": over})
+    total = 0.0
+    for phase, (runs, units, sec) in cost.items():
+        print(f"  {phase:6s}: {runs:3d} запусков, {units:7.0f} шагов (в единицах batch {t['batch_size']}) ≈ {sec / 3600:.2f} ч")
+        total += sec if phase != "pilot" else 0
+    print(f"  Итого tune + main + sens ≈ {total / 3600:.2f} ч (пилот отдельно: {cost['pilot'][2] / 60:.0f} мин)")
+
+
+def cmd_smoke(args):
+    """Сквозной тестовый прогон всего конвейера на уменьшенном протоколе: tune -> select-lr -> main -> sens -> stats."""
+    import shutil
+
+    from .budget import smoke_config
+    from .report import build_report
+    from .runner import execute, main_specs, read_runs, select_lr, sens_specs, top_for_sensitivity, tune_specs
+
+    cfg = smoke_config(_cfg(args), args.steps)
+    shutil.rmtree(cfg.results_dir, ignore_errors=True)
+    ctx = _context(cfg)
+    print("== tune")
+    execute(tune_specs(cfg), ctx, eval_scenarios=False)
+    print("выбранные LR:", select_lr(cfg))
+    print("== main")
+    execute(main_specs(cfg), ctx, eval_scenarios=True, save_probs=True)
+    print("== sens")
+    opts = top_for_sensitivity(cfg)
+    print("sensitivity для:", opts)
+    execute(sens_specs(cfg, opts), ctx, eval_scenarios=True)
+    print("== stats")
+    print("Отчёт:", build_report(cfg, read_runs(cfg)))
+    print(f"SMOKE OK. Результаты проверки лежат в {cfg.results_dir} (в основные results/ не попадают, можно удалить).")
 
 
 def cmd_pilot(args):
@@ -186,9 +255,12 @@ def main(argv=None):
     p = add("freeze", cmd_freeze, "этап 3: заморозить число шагов и целевой F1, защитить configs хешем")
     p.add_argument("--steps", type=int, required=True)
     p.add_argument("--target", type=float, required=True)
-    p = add("bench", cmd_bench, "замер секунд/шаг и оценка времени всех этапов")
+    p = add("bench", cmd_bench, "замер секунд/шаг, выбор micro_batch и оценка часов всех этапов")
     p.add_argument("--steps", type=int, default=30)
     p.add_argument("--plan-steps", type=int, default=0)
+    p.add_argument("--micro", type=int, nargs="*", help="micro_batch для сравнения, например: --micro 16 32 64")
+    p = add("smoke", cmd_smoke, "тестовый прогон всего конвейера на уменьшенном протоколе (минуты)")
+    p.add_argument("--steps", type=int, default=8)
     p = add("pilot", cmd_pilot, "этап 3: 8 оптимизаторов на одном seed")
     p.add_argument("--steps", type=int, default=0, help="переопределить число шагов только для пилота")
     add("tune", cmd_tune, "этап 4: подбор LR (8 x 7 x 2 запуска)")

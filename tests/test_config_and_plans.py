@@ -40,9 +40,10 @@ def test_missing_lock_blocks(tmp_path):
 
 def test_plan_sizes(cfg):
     assert len(OPTIMIZERS) == 8
-    assert len(tune_specs(cfg)) == 8 * 7 * 2 == 112
+    n = 8 * 7 * len(cfg.protocol["train"]["tuning_seeds"])
+    assert len(tune_specs(cfg)) == n == 56
     assert len(pilot_specs(cfg)) == 8
-    assert len({s.run_id for s in tune_specs(cfg)}) == 112
+    assert len({s.run_id for s in tune_specs(cfg)}) == n
 
 
 def test_lr_grids(cfg):

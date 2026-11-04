@@ -6,6 +6,8 @@ qwen  - небольшой Qwen с LoRA и классификационной г
 """
 from __future__ import annotations
 
+import copy
+
 import numpy as np
 import torch
 from torch import nn
@@ -30,13 +32,12 @@ class NgramBag(nn.Module):
 class QwenClassifier(nn.Module):
     """Qwen (заморожен, bf16) + LoRA (FP32) -> усреднение по токенам -> Dropout -> Linear."""
 
-    def __init__(self, qcfg: dict):
+    def __init__(self, qcfg: dict, base=None):
         super().__init__()
         from peft import LoraConfig, get_peft_model
-        from transformers import AutoModel
 
-        dtype = getattr(torch, qcfg["base_dtype"]) if torch.cuda.is_available() else torch.float32
-        base = AutoModel.from_pretrained(qcfg["name"], torch_dtype=dtype)
+        if base is None:
+            base = load_base(qcfg)
         lcfg = LoraConfig(r=qcfg["lora_r"], lora_alpha=qcfg["lora_alpha"], lora_dropout=qcfg["lora_dropout"],
                           target_modules=qcfg["lora_targets"], bias="none")
         self.backbone = get_peft_model(base, lcfg)
@@ -52,6 +53,13 @@ class QwenClassifier(nn.Module):
         m = attention_mask.unsqueeze(-1).to(h.dtype)
         pooled = (h * m).sum(1) / m.sum(1).clamp(min=1)
         return self.head(self.drop(pooled.float()))
+
+
+def load_base(qcfg: dict):
+    from transformers import AutoModel
+
+    dtype = getattr(torch, qcfg["base_dtype"]) if torch.cuda.is_available() else torch.float32
+    return AutoModel.from_pretrained(qcfg["name"], torch_dtype=dtype)
 
 
 class NgramBackend:
@@ -90,7 +98,9 @@ class QwenBackend:
 
         self.q = cfg["model"]["qwen"]
         self.micro_batch = self.q.get("micro_batch", 16)
+        self.eval_bs = self.q.get("eval_batch", 64)
         self.tok = AutoTokenizer.from_pretrained(self.q["name"])
+        self._base = None                      # чистая база Qwen: читается с диска один раз, в каждый запуск идёт копия
         self.pad_id = self.tok.pad_token_id if self.tok.pad_token_id is not None else 0
         self._cache: dict = {}
 
@@ -112,8 +122,10 @@ class QwenBackend:
         return {"input_ids": ids.to(device), "attention_mask": mask.to(device)}
 
     def build_model(self, seed: int):
+        if self._base is None:
+            self._base = load_base(self.q)
         torch.manual_seed(seed)
-        return QwenClassifier(self.q)
+        return QwenClassifier(self.q, copy.deepcopy(self._base))
 
 
 def make_backend(cfg: dict, name: str | None = None):

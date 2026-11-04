@@ -1,0 +1,136 @@
+diff --git a/PROTOCOL.md b/PROTOCOL.md
+index e6b79bc..ac293d3 100644
+--- a/PROTOCOL.md
++++ b/PROTOCOL.md
+@@ -39,12 +39,12 @@ S5: цепь версий T0 (исходная), T1 (все заголовки 
+ 
+ ## 4. Протокол запусков
+ 
+-- Одинаковые: данные, архитектура, batch size, число шагов (**120 по умолчанию, уточняется пилотом и замораживается**), scheduler (cosine, warmup 5 %), clip 1,0, лимит времени на запуск.
++- Одинаковые: данные, архитектура, batch size, число шагов (**80 по умолчанию, уточняется пилотом и замораживается**), scheduler (cosine, warmup 5 %), clip 1,0, лимит времени на запуск.
+ - Меняется только оптимизатор и его LR. Weight decay 0, кроме AdamW (0,01).
+ - LR: 7 точек на логарифмической сетке (Adam-семейство, AdaGrad, RMSprop: 1e-4...1e-1; SGD-семейство: 1e-3...1,0); выбор по val Macro-F1 на tuning-seed 100 (один seed ради времени, это отступление от «одинаковой процедуры на нескольких seed»; написать в угрозах валидности); при равенстве берётся меньший LR.
+ - Оценка: seed 0-4 (минимум по ТЗ: 5). Seed управляет инициализацией головы и LoRA, порядком батчей, dropout и разбором мутаций train. Test-мутации и val фиксированы.
+ - Логи: train loss и норма градиента каждые 20 шагов, val Macro-F1 каждые 20, финальные val/test, время (без оценок), пиковая память (GPU: max allocated; CPU: RSS), флаг нестабильности.
+-- Объём: настройка 56 запусков (8 x 7 x 1 seed), основной прогон 40 (8 x 5 seed), sensitivity 81 (топ-2 + SGD, 3 seed, по 9 вариантов: 5 LR, 2 batch size, 2 weight decay). Было: 112 / 80 / ~180 при 600 шагах (около 55 ч при 0,89 с/шаг).
++- Объём: настройка 56 запусков (8 x 7 x 1 seed), основной прогон 40 (8 x 5 seed), sensitivity 54 (топ-2 + SGD, 2 seed, по 9 вариантов: 5 LR, 2 batch size, 2 weight decay). Было: 112 / 80 / ~180 при 600 шагах (около 55 ч при 0,89 с/шаг).
+ 
+ ## 5. Метрики и направления
+ 
+@@ -90,4 +90,4 @@ S5: цепь версий T0 (исходная), T1 (все заголовки 
+ Лимит одного запуска: 5 минут чистого обучения (`train.time_limit_min`). Фактические часы зависят от карты: замерить `uv run lab4 bench` до пилота
+ и записать сюда: _(заполнить: с/шаг, micro_batch, пик памяти, часы по этапам из `lab4 bench`)_.
+ 
+-Ускорения относительно первой версии: шагов 120 вместо 600 (данные малы: 17 уникальных заголовков, около 1,3 эпохи), 1 tuning-seed вместо 2, 5 seed вместо 10, sensitivity на 3 seed и 3 оптимизаторах, база Qwen читается с диска один раз (копия на запуск), micro_batch выбирается замером. Если `bench` покажет больше нужного, дальше резать в таком порядке: seed в sensitivity, число точек LR в tune.
++Ускорения относительно первой версии: шагов 80 вместо 600 (данные малы: 17 уникальных заголовков, около 0,9 эпохи), при подборе LR нет промежуточных оценок val, 1 tuning-seed вместо 2, 5 seed вместо 10, sensitivity на 2 seed и 3 оптимизаторах, база Qwen читается с диска один раз (копия на запуск), micro_batch выбирается замером. Замер на RTX 4060: micro_batch 8: 1,341 с/шаг; 16: 0,825 (4,4 ГБ); 24: 0,861 (6,1 ГБ, выше не имеет смысла: GPU уже загружена). Оценка: tune 1,2 ч + main 1,1 ч + sens 1,5 ч ≈ 3,8 ч при 80 шагах; при 60 шагах ≈ 3,1 ч. Если и этого много, резать число точек LR в tune.
+diff --git a/TODO.md b/TODO.md
+index ae404de..b4462b9 100644
+--- a/TODO.md
++++ b/TODO.md
+@@ -35,7 +35,7 @@
+ ## Этап 3. Модель и пилот (1 день)
+ 
+ - [~] Qwen3-0.6B + LoRA и компактная n-gram модель, 8 оптимизаторов, общий цикл обучения (`train.py`). **Torch-код не запускался в среде разработки (нет GPU и доступа к PyPI/HF); первым делом `uv run pytest` и `uv run lab4 bench`**
+-- [~] Бюджет урезан (шаг 2): 120 шагов, tune 56, main 40, sens 81; запустить `uv run lab4 smoke`, затем `uv run lab4 bench --micro 8 16 24`, записать с/шаг, micro_batch и часы в PROTOCOL.md раздел 9
++- [~] Бюджет урезан (шаг 2): 80 шагов, tune 56, main 40, sens 54, micro_batch 16 (замер: 0,825 с/шаг, 4,4 ГБ), оценка ≈ 3,8 ч; `lab4 smoke` прошёл; запустить `uv run lab4 smoke`, затем `uv run lab4 bench --micro 8 16 24`, записать с/шаг, micro_batch и часы в PROTOCOL.md раздел 9
+ - [ ] `uv run lab4 pilot` -> выбрать число шагов и целевой F1 -> `uv run lab4 freeze --steps N --target F`
+ 
+ ## Этап 4. Настройка LR (1 день)
+diff --git a/configs/protocol.yaml b/configs/protocol.yaml
+index 0ba4712..2056dcb 100644
+--- a/configs/protocol.yaml
++++ b/configs/protocol.yaml
+@@ -26,11 +26,11 @@ model:
+     dropout: 0.2
+ train:
+   batch_size: 64
+-  steps: 120                  # ПРЕДЛОЖЕНИЕ (было 600: данные малы, 17 уникальных заголовков), уточняется на пилоте и замораживается
++  steps: 80                   # ПРЕДЛОЖЕНИЕ (было 600; замер 0,825 с/шаг на RTX 4060), уточняется на пилоте и замораживается
+   warmup_frac: 0.05
+   scheduler: cosine
+   grad_clip: 1.0
+-  eval_every: 20              # val Macro-F1
++  eval_every: 10              # val Macro-F1
+   log_every: 20               # train loss и норма градиента
+   target_val_f1: 0.90         # ПРЕДЛОЖЕНИЕ (ориентир из ТЗ), уточняется на пилоте
+   copies_train: 4             # 1 исходная + 3 мутированные копии каждой колонки (мутации перебрасываются по seed)
+@@ -38,7 +38,7 @@ train:
+   copies_test: 3
+   tuning_seeds: [100]
+   eval_seeds: [0, 1, 2, 3, 4]   # минимум по ТЗ: 5
+-  sens_seeds: [0, 1, 2]
++  sens_seeds: [0, 1]
+   time_limit_min: 5           # лимит одного запуска (общий для всех оптимизаторов)
+ selection:
+   max_unstable_share: 0.20
+diff --git a/src/vkr/lab4/budget.py b/src/vkr/lab4/budget.py
+index 304c393..91070c2 100644
+--- a/src/vkr/lab4/budget.py
++++ b/src/vkr/lab4/budget.py
+@@ -14,13 +14,16 @@ def plan_specs(cfg, lrs: dict | None = None) -> dict:
+     return {"pilot": pilot_specs(cfg), "tune": tune_specs(cfg), "main": main_specs(cfg, lrs), "sens": sens_specs(cfg, top, lrs)}
+ 
+ 
+-def plan_cost(cfg, per_step_s: float, overhead_s: float, lrs: dict | None = None) -> dict:
+-    """Фаза -> (запусков, шагов в единицах batch=64, секунд). Стоимость шага считается пропорциональной batch size."""
++def plan_cost(cfg, per_step_s: float, overhead_s, lrs: dict | None = None) -> dict:
++    """Фаза -> (запусков, шагов в единицах batch=64, секунд). Стоимость шага пропорциональна batch size.
++
++    overhead_s: число (одинаково для всех фаз) или dict {фаза: секунд на запуск}: в pilot и tune нет оценки сценариев S0-S5, там накладные расходы меньше."""
+     t = cfg.protocol["train"]
+     out = {}
+     for phase, specs in plan_specs(cfg, lrs).items():
++        over = overhead_s[phase] if isinstance(overhead_s, dict) else overhead_s
+         units = sum((s.steps or t["steps"]) * s.batch_size / t["batch_size"] for s in specs)
+-        out[phase] = (len(specs), units, units * per_step_s + len(specs) * overhead_s)
++        out[phase] = (len(specs), units, units * per_step_s + len(specs) * over)
+     return out
+ 
+ 
+diff --git a/src/vkr/lab4/cli.py b/src/vkr/lab4/cli.py
+index 9622654..4905912 100644
+--- a/src/vkr/lab4/cli.py
++++ b/src/vkr/lab4/cli.py
+@@ -140,7 +140,11 @@ def cmd_bench(args):
+     be.micro_batch = m
+     t["steps"] = plan_steps
+     print(f"\nЛучший micro_batch: {m}. Впишите его в configs/protocol.yaml (model.qwen.micro_batch).")
+-    cost = plan_cost(cfg, per, over)
++    t0 = time.perf_counter()
++    row = train_run(RunSpec("bench", "adamw", 1e-3, 0, steps=n), ctx, None, eval_scenarios=False)
++    over_tune = max(0.0, time.perf_counter() - t0 - row["train_time_s"])
++    print(f"накладные расходы на запуск: с оценкой сценариев {over:.1f} с (main, sens), без неё {over_tune:.1f} с (pilot, tune)")
++    cost = plan_cost(cfg, per, {"pilot": over_tune, "tune": over_tune, "main": over, "sens": over})
+     total = 0.0
+     for phase, (runs, units, sec) in cost.items():
+         print(f"  {phase:6s}: {runs:3d} запусков, {units:7.0f} шагов (в единицах batch {t['batch_size']}) ≈ {sec / 3600:.2f} ч")
+diff --git a/src/vkr/lab4/train.py b/src/vkr/lab4/train.py
+index 7ccaae2..96d68d3 100644
+--- a/src/vkr/lab4/train.py
++++ b/src/vkr/lab4/train.py
+@@ -146,7 +146,7 @@ def train_run(spec: RunSpec, ctx: Context, log_dir: Path | None = None, eval_sce
+             rss_peak = max(rss_peak, _rss_mb())
+             if len(win_means) > 2 and w > 3 * running_min and not reason:
+                 reason = "loss_growth_3x"
+-        if done_steps % tcfg["eval_every"] == 0:
++        if done_steps % tcfg["eval_every"] == 0 and spec.phase != "tune":     # при подборе LR нужен только итоговый val F1
+             _sync(device)
+             t0 = time.perf_counter()
+             f1 = macro_f1(val_y, predict_probs(model, backend, ctx.val, device).argmax(1))
+diff --git a/tests/test_budget.py b/tests/test_budget.py
+index 5580ab1..632de97 100644
+--- a/tests/test_budget.py
++++ b/tests/test_budget.py
+@@ -7,10 +7,10 @@ from vkr.lab4.runner import sens_specs
+ 
+ def test_plan_sizes_and_budget(cfg):
+     sp = plan_specs(cfg)
+-    assert {k: len(v) for k, v in sp.items()} == {"pilot": 8, "tune": 56, "main": 40, "sens": 81}
++    assert {k: len(v) for k, v in sp.items()} == {"pilot": 8, "tune": 56, "main": 40, "sens": 54}
+     cost = plan_cost(cfg, per_step_s=0.5, overhead_s=10)
+     total_h = sum(v[2] for k, v in cost.items() if k != "pilot") / 3600
+-    assert total_h < 4          # при 0.5 с/шаг и 10 с накладных всё укладывается в несколько часов
++    assert total_h < 3          # при 0.5 с/шаг и 10 с накладных всё укладывается в несколько часов
+ 
+ 
+ def test_sens_has_no_duplicates(cfg):

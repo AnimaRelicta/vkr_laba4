@@ -14,3 +14,5 @@ data/lab1/
 data/demo/
 results/
 .pytest_cache/
+results
+results_smoke

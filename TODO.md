@@ -35,7 +35,7 @@
 ## Этап 3. Модель и пилот (1 день)
 
 - [~] Qwen3-0.6B + LoRA и компактная n-gram модель, 8 оптимизаторов, общий цикл обучения (`train.py`). **Torch-код не запускался в среде разработки (нет GPU и доступа к PyPI/HF); первым делом `uv run pytest` и `uv run lab4 bench`**
-- [ ] `uv run lab4 bench`: замер с/шаг и память на RTX 4060, записать в PROTOCOL.md раздел 9
+- [~] Бюджет урезан (шаг 2): 80 шагов, tune 56, main 40, sens 54, micro_batch 16 (замер: 0,825 с/шаг, 4,4 ГБ), оценка ≈ 3,8 ч; `lab4 smoke` прошёл; запустить `uv run lab4 smoke`, затем `uv run lab4 bench --micro 8 16 24`, записать с/шаг, micro_batch и часы в PROTOCOL.md раздел 9
 - [ ] `uv run lab4 pilot` -> выбрать число шагов и целевой F1 -> `uv run lab4 freeze --steps N --target F`
 
 ## Этап 4. Настройка LR (1 день)

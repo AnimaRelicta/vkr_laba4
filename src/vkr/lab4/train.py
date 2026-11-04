@@ -47,9 +47,10 @@ def _labels(df: pd.DataFrame) -> np.ndarray:
 
 
 @torch.no_grad()
-def predict_probs(model, backend, df: pd.DataFrame, device, cache: dict | None = None, bs: int = 256) -> np.ndarray:
+def predict_probs(model, backend, df: pd.DataFrame, device, cache: dict | None = None, bs: int | None = None) -> np.ndarray:
     """Вероятности классов; одинаковые (заголовок, значения) считаются один раз."""
     model.eval()
+    bs = bs or getattr(backend, "eval_bs", 256)
     keys = list(zip(df["header_text"], df["values_sample"]))
     cache = {} if cache is None else cache
     todo = [k for k in dict.fromkeys(keys) if k not in cache]
@@ -145,7 +146,7 @@ def train_run(spec: RunSpec, ctx: Context, log_dir: Path | None = None, eval_sce
             rss_peak = max(rss_peak, _rss_mb())
             if len(win_means) > 2 and w > 3 * running_min and not reason:
                 reason = "loss_growth_3x"
-        if done_steps % tcfg["eval_every"] == 0:
+        if done_steps % tcfg["eval_every"] == 0 and spec.phase != "tune":     # при подборе LR нужен только итоговый val F1
             _sync(device)
             t0 = time.perf_counter()
             f1 = macro_f1(val_y, predict_probs(model, backend, ctx.val, device).argmax(1))

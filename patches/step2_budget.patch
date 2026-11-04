@@ -1,0 +1,445 @@
+diff --git a/PROTOCOL.md b/PROTOCOL.md
+index 66ef7c7..e6b79bc 100644
+--- a/PROTOCOL.md
++++ b/PROTOCOL.md
+@@ -39,12 +39,12 @@ S5: цепь версий T0 (исходная), T1 (все заголовки 
+ 
+ ## 4. Протокол запусков
+ 
+-- Одинаковые: данные, архитектура, batch size, число шагов (**определяется пилотом и замораживается**), scheduler (cosine, warmup 5 %), clip 1,0, лимит времени на запуск.
++- Одинаковые: данные, архитектура, batch size, число шагов (**120 по умолчанию, уточняется пилотом и замораживается**), scheduler (cosine, warmup 5 %), clip 1,0, лимит времени на запуск.
+ - Меняется только оптимизатор и его LR. Weight decay 0, кроме AdamW (0,01).
+-- LR: 7 точек на логарифмической сетке (Adam-семейство, AdaGrad, RMSprop: 1e-4...1e-1; SGD-семейство: 1e-3...1,0); выбор по среднему val Macro-F1 на tuning-seed 100 и 101; при равенстве берётся меньший LR.
+-- Оценка: seed 0-9. Seed управляет инициализацией головы и LoRA, порядком батчей, dropout и разбором мутаций train. Test-мутации и val фиксированы.
+-- Логи: train loss и норма градиента каждые 50 шагов, val Macro-F1 каждые 100, финальные val/test, время (без оценок), пиковая память (GPU: max allocated; CPU: RSS), флаг нестабильности.
+-- Объём: настройка 112, основной прогон 80, sensitivity около 180 запусков (топ-3 + SGD, 5 seed).
++- LR: 7 точек на логарифмической сетке (Adam-семейство, AdaGrad, RMSprop: 1e-4...1e-1; SGD-семейство: 1e-3...1,0); выбор по val Macro-F1 на tuning-seed 100 (один seed ради времени, это отступление от «одинаковой процедуры на нескольких seed»; написать в угрозах валидности); при равенстве берётся меньший LR.
++- Оценка: seed 0-4 (минимум по ТЗ: 5). Seed управляет инициализацией головы и LoRA, порядком батчей, dropout и разбором мутаций train. Test-мутации и val фиксированы.
++- Логи: train loss и норма градиента каждые 20 шагов, val Macro-F1 каждые 20, финальные val/test, время (без оценок), пиковая память (GPU: max allocated; CPU: RSS), флаг нестабильности.
++- Объём: настройка 56 запусков (8 x 7 x 1 seed), основной прогон 40 (8 x 5 seed), sensitivity 81 (топ-2 + SGD, 3 seed, по 9 вариантов: 5 LR, 2 batch size, 2 weight decay). Было: 112 / 80 / ~180 при 600 шагах (около 55 ч при 0,89 с/шаг).
+ 
+ ## 5. Метрики и направления
+ 
+@@ -87,5 +87,7 @@ S5: цепь версий T0 (исходная), T1 (все заголовки 
+ 
+ ## 9. Бюджет и лимиты
+ 
+-Лимит одного запуска: 15 минут чистого обучения (`train.time_limit_min`). Фактические часы зависят от карты: замерить `uv run lab4 bench` до пилота
+-и записать сюда: _(заполнить)_.
++Лимит одного запуска: 5 минут чистого обучения (`train.time_limit_min`). Фактические часы зависят от карты: замерить `uv run lab4 bench` до пилота
++и записать сюда: _(заполнить: с/шаг, micro_batch, пик памяти, часы по этапам из `lab4 bench`)_.
++
++Ускорения относительно первой версии: шагов 120 вместо 600 (данные малы: 17 уникальных заголовков, около 1,3 эпохи), 1 tuning-seed вместо 2, 5 seed вместо 10, sensitivity на 3 seed и 3 оптимизаторах, база Qwen читается с диска один раз (копия на запуск), micro_batch выбирается замером. Если `bench` покажет больше нужного, дальше резать в таком порядке: seed в sensitivity, число точек LR в tune.
+diff --git a/README.md b/README.md
+index b1f64f8..31a3304 100644
+--- a/README.md
++++ b/README.md
+@@ -48,7 +48,10 @@ uv run lab4 passport
+ uv run lab4 check-data --dir data/lab1/out --dir data/lab1/out_hard --llm-dir data/lab1/llm_out_hard
+ 
+ # замер скорости на вашей карте и оценка времени всех этапов
+-uv run lab4 bench --steps 30 --plan-steps 600
++uv run lab4 bench --steps 30 --micro 16 32 64   # выберет micro_batch и оценит часы по реальным планам
++
++# тестовый прогон ВСЕГО конвейера на уменьшенном протоколе (минуты), результаты в results_smoke/
++uv run lab4 smoke
+ 
+ # этап 3: пилот (8 оптимизаторов, seed 0), затем заморозить число шагов и целевой F1
+ uv run lab4 pilot
+diff --git a/TODO.md b/TODO.md
+index a1228b2..0dae1a4 100644
+--- a/TODO.md
++++ b/TODO.md
+@@ -35,7 +35,7 @@
+ ## Этап 3. Модель и пилот (1 день)
+ 
+ - [~] Qwen3-0.6B + LoRA и компактная n-gram модель, 8 оптимизаторов, общий цикл обучения (`train.py`). **Torch-код не запускался в среде разработки (нет GPU и доступа к PyPI/HF); первым делом `uv run pytest` и `uv run lab4 bench`**
+-- [ ] `uv run lab4 bench`: замер с/шаг и память на RTX 4060, записать в PROTOCOL.md раздел 9
++- [~] Бюджет урезан (шаг 2): 120 шагов, tune 56, main 40, sens 81; запустить `uv run lab4 smoke`, затем `uv run lab4 bench --micro 16 32 64`, записать с/шаг, micro_batch и часы в PROTOCOL.md раздел 9
+ - [ ] `uv run lab4 pilot` -> выбрать число шагов и целевой F1 -> `uv run lab4 freeze --steps N --target F`
+ 
+ ## Этап 4. Настройка LR (1 день)
+diff --git a/configs/grid.yaml b/configs/grid.yaml
+index 9d972f2..eba6816 100644
+--- a/configs/grid.yaml
++++ b/configs/grid.yaml
+@@ -1,5 +1,5 @@
+ # Сетка LR и параметры оптимизаторов. Одинаковая процедура для всех: 7 точек на лог-сетке,
+-# выбор по среднему val Macro-F1 на двух tuning-seed (100, 101).
++# выбор по val Macro-F1 на tuning-seed (100).
+ optimizers:
+   sgd:      {family: sgd,  momentum: 0.0, nesterov: false, weight_decay: 0.0}
+   momentum: {family: sgd,  momentum: 0.9, nesterov: false, weight_decay: 0.0}
+@@ -13,9 +13,9 @@ lr_grid:                       # 7 значений, логарифмическ
+   adam: {min: 1.0e-4, max: 1.0e-1, n: 7}   # «Adam-семейство»: адаптивные методы
+   sgd:  {min: 1.0e-3, max: 1.0,    n: 7}   # «SGD-семейство»
+ sensitivity:
+-  optimizers_top: 3            # топ-3 по сводному баллу + SGD
++  optimizers_top: 2            # топ-2 по сводному баллу + SGD
+   lr_multipliers: [0.1, 0.3333333, 1.0, 3.0, 10.0]
+-  batch_sizes: [16, 32, 64, 128]
++  batch_sizes: [32, 64, 128]
+   weight_decays: [0.0, 1.0e-4, 1.0e-2]
+ noise:
+   checkpoint_step: 500
+diff --git a/configs/protocol.yaml b/configs/protocol.yaml
+index 04a8abd..abf99a5 100644
+--- a/configs/protocol.yaml
++++ b/configs/protocol.yaml
+@@ -13,7 +13,7 @@ model:
+     lora_dropout: 0.05
+     lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+     max_len: 64
+-    micro_batch: 16           # градиентная аккумуляция: эффективный batch = train.batch_size, память активаций в 4 раза меньше
++    micro_batch: 32           # градиентная аккумуляция: эффективный batch = train.batch_size; выбрать по `lab4 bench --micro 16 32 64`
+     head_dropout: 0.2
+     base_dtype: bfloat16      # база заморожена; LoRA-адаптеры и голова обучаются в FP32
+   ngram:
+@@ -25,20 +25,20 @@ model:
+     dropout: 0.2
+ train:
+   batch_size: 64
+-  steps: 600                  # ПРЕДЛОЖЕНИЕ, уточняется на пилоте и замораживается
++  steps: 120                  # ПРЕДЛОЖЕНИЕ (было 600: данные малы, 17 уникальных заголовков), уточняется на пилоте и замораживается
+   warmup_frac: 0.05
+   scheduler: cosine
+   grad_clip: 1.0
+-  eval_every: 100             # val Macro-F1
+-  log_every: 50               # train loss и норма градиента
++  eval_every: 20              # val Macro-F1
++  log_every: 20               # train loss и норма градиента
+   target_val_f1: 0.90         # ПРЕДЛОЖЕНИЕ (ориентир из ТЗ), уточняется на пилоте
+   copies_train: 4             # 1 исходная + 3 мутированные копии каждой колонки (мутации перебрасываются по seed)
+   copies_val: 2
+   copies_test: 3
+-  tuning_seeds: [100, 101]
+-  eval_seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+-  sens_seeds: [0, 1, 2, 3, 4]
+-  time_limit_min: 15          # лимит одного запуска (общий для всех оптимизаторов)
++  tuning_seeds: [100]
++  eval_seeds: [0, 1, 2, 3, 4]   # минимум по ТЗ: 5
++  sens_seeds: [0, 1, 2]
++  time_limit_min: 5           # лимит одного запуска (общий для всех оптимизаторов)
+ selection:
+   max_unstable_share: 0.20
+   weights: {f1: 0.40, std: 0.20, ece: 0.15, steps_to_target: 0.15, memory: 0.10}
+diff --git a/src/vkr/lab4/budget.py b/src/vkr/lab4/budget.py
+new file mode 100644
+index 0000000..304c393
+--- /dev/null
++++ b/src/vkr/lab4/budget.py
+@@ -0,0 +1,36 @@
++"""Бюджет времени и режим smoke (без torch, поэтому тестируется на любой машине)."""
++from __future__ import annotations
++
++from .optimizers import OPTIMIZERS, lr_grid
++from .runner import main_specs, pilot_specs, sens_specs, tune_specs
++
++_TOP_GUESS = ["adamw", "adam", "nesterov", "momentum"]
++
++
++def plan_specs(cfg, lrs: dict | None = None) -> dict:
++    """Все фазы с реальными списками запусков. LR до `select-lr` неизвестны: подставляется 4-я точка сетки (на число запусков не влияет)."""
++    lrs = lrs or {o: lr_grid(cfg.grid, o)[min(3, len(lr_grid(cfg.grid, o)) - 1)] for o in OPTIMIZERS}
++    top = _TOP_GUESS[: cfg.grid["sensitivity"]["optimizers_top"]] + ["sgd"]
++    return {"pilot": pilot_specs(cfg), "tune": tune_specs(cfg), "main": main_specs(cfg, lrs), "sens": sens_specs(cfg, top, lrs)}
++
++
++def plan_cost(cfg, per_step_s: float, overhead_s: float, lrs: dict | None = None) -> dict:
++    """Фаза -> (запусков, шагов в единицах batch=64, секунд). Стоимость шага считается пропорциональной batch size."""
++    t = cfg.protocol["train"]
++    out = {}
++    for phase, specs in plan_specs(cfg, lrs).items():
++        units = sum((s.steps or t["steps"]) * s.batch_size / t["batch_size"] for s in specs)
++        out[phase] = (len(specs), units, units * per_step_s + len(specs) * overhead_s)
++    return out
++
++
++def smoke_config(cfg, steps: int = 8):
++    """Уменьшенный протокол для сквозной проверки кода (несколько минут). Результаты идут в results_smoke/, не в results/."""
++    t = cfg.protocol["train"]
++    t.update(steps=steps, eval_every=max(1, steps // 2), log_every=max(1, steps // 4), tuning_seeds=[100],
++             eval_seeds=[0, 1], sens_seeds=[0], time_limit_min=5)
++    for fam in cfg.grid["lr_grid"].values():
++        fam["n"] = 2                     # концы сетки: проверяется и расходящийся запуск (SGD lr=1)
++    cfg.grid["sensitivity"].update(optimizers_top=2, lr_multipliers=[1.0, 3.0], batch_sizes=[32, 64], weight_decays=[0.0, 0.01])
++    cfg.protocol["paths"]["results"] = "results_smoke"
++    return cfg
+diff --git a/src/vkr/lab4/cli.py b/src/vkr/lab4/cli.py
+index eb7785f..c9f3b2f 100644
+--- a/src/vkr/lab4/cli.py
++++ b/src/vkr/lab4/cli.py
+@@ -85,27 +85,84 @@ def cmd_freeze(args):
+ 
+ 
+ def cmd_bench(args):
++    """Замер скорости: прогрев, затем один запуск на каждый micro_batch (с оценками), оценка часов по реальным планам запусков."""
+     import time
+ 
+-    import torch
++    import numpy as np
+ 
+-    from .optimizers import OPTIMIZERS
+-    cfg = _cfg(args)
+-    ctx = _context(cfg)
+-    n, plan_default = args.steps, cfg.protocol["train"]["steps"]
+-    cfg.protocol["train"].update({"steps": n, "eval_every": 10**9, "target_val_f1": 2.0})
++    from .budget import plan_cost
+     from .spec import RunSpec
+     from .train import train_run
+-    t0 = time.perf_counter()
+-    row = train_run(RunSpec("bench", "adamw", 1e-3, 0, steps=n), ctx, None, eval_scenarios=False)
+-    dt = time.perf_counter() - t0
+-    per = row["train_time_s"] / max(1, row["steps_done"])
++
++    cfg = _cfg(args)
++    ctx = _context(cfg)
+     t = cfg.protocol["train"]
+-    plan = {"tuning (112)": len(OPTIMIZERS) * 7 * len(t["tuning_seeds"]), "main (80)": len(OPTIMIZERS) * len(t["eval_seeds"]), "sensitivity (~180)": 180}
+-    print(f"{per:.3f} с/шаг, пиковая память {row['peak_mem_mb']:.0f} МБ, обучаемых параметров {row['n_trainable']:,} (всего {dt:.1f} с на {n} шагов)")
+-    steps = args.plan_steps or plan_default
+-    for k, v in plan.items():
+-        print(f"  {k}: {v} запусков x {steps} шагов ≈ {v * steps * per / 3600:.1f} ч (без оценки на val/test)")
++    plan_steps, n = args.plan_steps or t["steps"], args.steps
++    evals = max(1, plan_steps // t["eval_every"])          # столько же оценок на val, сколько в настоящем запуске
++    t.update({"steps": n, "eval_every": max(1, n // evals), "target_val_f1": 2.0})
++    be = ctx.backend
++    if be.name == "qwen":
++        tr = ctx.splits["train"]
++        L = np.array([len(be.encode_one(h, v)) for h, v in zip(tr["header_text"], tr["values_sample"])])
++        print(f"Длина входа, токенов: среднее {L.mean():.1f}, p95 {np.percentile(L, 95):.0f}, макс {L.max()}; "
++              f"обрезано по max_len={be.q['max_len']}: {100 * (L >= be.q['max_len']).mean():.1f} %")
++    micros = args.micro or [be.micro_batch]
++    train_run(RunSpec("bench", "adamw", 1e-3, 0, steps=3), ctx, None, eval_scenarios=False)     # прогрев CUDA
++    res = []
++    for m in micros:
++        be.micro_batch = m
++        t0 = time.perf_counter()
++        try:
++            row = train_run(RunSpec("bench", "adamw", 1e-3, 0, steps=n), ctx, None, eval_scenarios=True)
++        except RuntimeError as e:
++            if "out of memory" not in str(e).lower():
++                raise
++            import torch
++            torch.cuda.empty_cache()
++            print(f"micro_batch={m}: не хватило памяти")
++            continue
++        dt = time.perf_counter() - t0
++        per, over = row["train_time_s"] / max(1, row["steps_done"]), dt - row["train_time_s"]
++        res.append((per, over, m))
++        print(f"micro_batch={m}: {per:.3f} с/шаг, пик памяти {row['peak_mem_mb']:.0f} МБ, "
++              f"обучаемых параметров {row['n_trainable']:,}, накладные расходы на запуск {over:.1f} с (сборка модели + оценки)")
++    if not res:
++        raise SystemExit("Ни один вариант не отработал")
++    per, over, m = min(res)
++    be.micro_batch = m
++    t["steps"] = plan_steps
++    print(f"\nЛучший micro_batch: {m}. Впишите его в configs/protocol.yaml (model.qwen.micro_batch).")
++    cost = plan_cost(cfg, per, over)
++    total = 0.0
++    for phase, (runs, units, sec) in cost.items():
++        print(f"  {phase:6s}: {runs:3d} запусков, {units:7.0f} шагов (в единицах batch {t['batch_size']}) ≈ {sec / 3600:.2f} ч")
++        total += sec if phase != "pilot" else 0
++    print(f"  Итого tune + main + sens ≈ {total / 3600:.2f} ч (пилот отдельно: {cost['pilot'][2] / 60:.0f} мин)")
++
++
++def cmd_smoke(args):
++    """Сквозной тестовый прогон всего конвейера на уменьшенном протоколе: tune -> select-lr -> main -> sens -> stats."""
++    import shutil
++
++    from .budget import smoke_config
++    from .report import build_report
++    from .runner import execute, main_specs, read_runs, select_lr, sens_specs, top_for_sensitivity, tune_specs
++
++    cfg = smoke_config(_cfg(args), args.steps)
++    shutil.rmtree(cfg.results_dir, ignore_errors=True)
++    ctx = _context(cfg)
++    print("== tune")
++    execute(tune_specs(cfg), ctx, eval_scenarios=False)
++    print("выбранные LR:", select_lr(cfg))
++    print("== main")
++    execute(main_specs(cfg), ctx, eval_scenarios=True, save_probs=True)
++    print("== sens")
++    opts = top_for_sensitivity(cfg)
++    print("sensitivity для:", opts)
++    execute(sens_specs(cfg, opts), ctx, eval_scenarios=True)
++    print("== stats")
++    print("Отчёт:", build_report(cfg, read_runs(cfg)))
++    print(f"SMOKE OK. Результаты проверки лежат в {cfg.results_dir} (в основные results/ не попадают, можно удалить).")
+ 
+ 
+ def cmd_pilot(args):
+@@ -186,9 +243,12 @@ def main(argv=None):
+     p = add("freeze", cmd_freeze, "этап 3: заморозить число шагов и целевой F1, защитить configs хешем")
+     p.add_argument("--steps", type=int, required=True)
+     p.add_argument("--target", type=float, required=True)
+-    p = add("bench", cmd_bench, "замер секунд/шаг и оценка времени всех этапов")
++    p = add("bench", cmd_bench, "замер секунд/шаг, выбор micro_batch и оценка часов всех этапов")
+     p.add_argument("--steps", type=int, default=30)
+     p.add_argument("--plan-steps", type=int, default=0)
++    p.add_argument("--micro", type=int, nargs="*", help="micro_batch для сравнения, например: --micro 16 32 64")
++    p = add("smoke", cmd_smoke, "тестовый прогон всего конвейера на уменьшенном протоколе (минуты)")
++    p.add_argument("--steps", type=int, default=8)
+     p = add("pilot", cmd_pilot, "этап 3: 8 оптимизаторов на одном seed")
+     p.add_argument("--steps", type=int, default=0, help="переопределить число шагов только для пилота")
+     add("tune", cmd_tune, "этап 4: подбор LR (8 x 7 x 2 запуска)")
+diff --git a/src/vkr/lab4/models.py b/src/vkr/lab4/models.py
+index 03b437f..58ec559 100644
+--- a/src/vkr/lab4/models.py
++++ b/src/vkr/lab4/models.py
+@@ -6,6 +6,8 @@ qwen  - небольшой Qwen с LoRA и классификационной г
+ """
+ from __future__ import annotations
+ 
++import copy
++
+ import numpy as np
+ import torch
+ from torch import nn
+@@ -30,13 +32,12 @@ class NgramBag(nn.Module):
+ class QwenClassifier(nn.Module):
+     """Qwen (заморожен, bf16) + LoRA (FP32) -> усреднение по токенам -> Dropout -> Linear."""
+ 
+-    def __init__(self, qcfg: dict):
++    def __init__(self, qcfg: dict, base=None):
+         super().__init__()
+         from peft import LoraConfig, get_peft_model
+-        from transformers import AutoModel
+ 
+-        dtype = getattr(torch, qcfg["base_dtype"]) if torch.cuda.is_available() else torch.float32
+-        base = AutoModel.from_pretrained(qcfg["name"], torch_dtype=dtype)
++        if base is None:
++            base = load_base(qcfg)
+         lcfg = LoraConfig(r=qcfg["lora_r"], lora_alpha=qcfg["lora_alpha"], lora_dropout=qcfg["lora_dropout"],
+                           target_modules=qcfg["lora_targets"], bias="none")
+         self.backbone = get_peft_model(base, lcfg)
+@@ -54,6 +55,13 @@ class QwenClassifier(nn.Module):
+         return self.head(self.drop(pooled.float()))
+ 
+ 
++def load_base(qcfg: dict):
++    from transformers import AutoModel
++
++    dtype = getattr(torch, qcfg["base_dtype"]) if torch.cuda.is_available() else torch.float32
++    return AutoModel.from_pretrained(qcfg["name"], torch_dtype=dtype)
++
++
+ class NgramBackend:
+     name = "ngram"
+ 
+@@ -91,6 +99,7 @@ class QwenBackend:
+         self.q = cfg["model"]["qwen"]
+         self.micro_batch = self.q.get("micro_batch", 16)
+         self.tok = AutoTokenizer.from_pretrained(self.q["name"])
++        self._base = None                      # чистая база Qwen: читается с диска один раз, в каждый запуск идёт копия
+         self.pad_id = self.tok.pad_token_id if self.tok.pad_token_id is not None else 0
+         self._cache: dict = {}
+ 
+@@ -112,8 +121,10 @@ class QwenBackend:
+         return {"input_ids": ids.to(device), "attention_mask": mask.to(device)}
+ 
+     def build_model(self, seed: int):
++        if self._base is None:
++            self._base = load_base(self.q)
+         torch.manual_seed(seed)
+-        return QwenClassifier(self.q)
++        return QwenClassifier(self.q, copy.deepcopy(self._base))
+ 
+ 
+ def make_backend(cfg: dict, name: str | None = None):
+diff --git a/src/vkr/lab4/runner.py b/src/vkr/lab4/runner.py
+index 351dd2e..661548c 100644
+--- a/src/vkr/lab4/runner.py
++++ b/src/vkr/lab4/runner.py
+@@ -76,7 +76,7 @@ def execute(specs: list[RunSpec], ctx, eval_scenarios: bool, save_probs: bool =
+ def pilot_specs(cfg, seed: int = 0) -> list[RunSpec]:
+     """8 оптимизаторов, один seed, LR из середины сетки (4-я из 7 точек)."""
+     bs = cfg.protocol["train"]["batch_size"]
+-    return [RunSpec("pilot", o, lr_grid(cfg.grid, o)[3], seed, bs) for o in OPTIMIZERS]
++    return [RunSpec("pilot", o, lr_grid(cfg.grid, o)[min(3, len(lr_grid(cfg.grid, o)) - 1)], seed, bs) for o in OPTIMIZERS]
+ 
+ 
+ def tune_specs(cfg) -> list[RunSpec]:
+@@ -109,14 +109,14 @@ def load_selected_lr(cfg) -> dict:
+     return json.loads(p.read_text(encoding="utf-8"))
+ 
+ 
+-def main_specs(cfg) -> list[RunSpec]:
+-    t, lrs = cfg.protocol["train"], load_selected_lr(cfg)
++def main_specs(cfg, lrs: dict | None = None) -> list[RunSpec]:
++    t, lrs = cfg.protocol["train"], lrs or load_selected_lr(cfg)
+     return [RunSpec("main", o, lrs[o], s, t["batch_size"]) for o in OPTIMIZERS for s in t["eval_seeds"]]
+ 
+ 
+-def sens_specs(cfg, optimizers: list[str]) -> list[RunSpec]:
+-    """Один фактор за раз: LR x{0.1, 1/3, 1, 3, 10}, batch size, weight decay; 5 seed."""
+-    t, g, lrs = cfg.protocol["train"], cfg.grid["sensitivity"], load_selected_lr(cfg)
++def sens_specs(cfg, optimizers: list[str], lrs: dict | None = None) -> list[RunSpec]:
++    """Один фактор за раз: LR x{0.1, 1/3, 1, 3, 10}, batch size, weight decay. Значения, равные базовым, не дублируются."""
++    t, g, lrs = cfg.protocol["train"], cfg.grid["sensitivity"], lrs or load_selected_lr(cfg)
+     specs: dict[str, RunSpec] = {}
+     for o in optimizers:
+         for s in t["sens_seeds"]:
+@@ -127,7 +127,8 @@ def sens_specs(cfg, optimizers: list[str]) -> list[RunSpec]:
+                 sp = RunSpec("sens", o, lrs[o], s, bs)
+                 specs[sp.run_id] = sp
+             for wd in g["weight_decays"]:
+-                sp = RunSpec("sens", o, lrs[o], s, t["batch_size"], weight_decay=wd)
++                base_wd = cfg.grid["optimizers"][o].get("weight_decay", 0.0)
++                sp = RunSpec("sens", o, lrs[o], s, t["batch_size"], weight_decay=None if wd == base_wd else wd)
+                 specs[sp.run_id] = sp
+     return list(specs.values())
+ 
+diff --git a/tests/test_budget.py b/tests/test_budget.py
+new file mode 100644
+index 0000000..5580ab1
+--- /dev/null
++++ b/tests/test_budget.py
+@@ -0,0 +1,30 @@
++import copy
++
++from vkr.lab4.budget import plan_cost, plan_specs, smoke_config
++from vkr.lab4.config import Config
++from vkr.lab4.runner import sens_specs
++
++
++def test_plan_sizes_and_budget(cfg):
++    sp = plan_specs(cfg)
++    assert {k: len(v) for k, v in sp.items()} == {"pilot": 8, "tune": 56, "main": 40, "sens": 81}
++    cost = plan_cost(cfg, per_step_s=0.5, overhead_s=10)
++    total_h = sum(v[2] for k, v in cost.items() if k != "pilot") / 3600
++    assert total_h < 4          # при 0.5 с/шаг и 10 с накладных всё укладывается в несколько часов
++
++
++def test_sens_has_no_duplicates(cfg):
++    specs = sens_specs(cfg, ["adamw", "sgd"], {"adamw": 1e-3, "sgd": 0.1})
++    assert len({s.run_id for s in specs}) == len(specs)
++    # 5 LR + 2 нестандартных batch size + 2 нестандартных weight decay на каждый seed
++    per_seed = len(specs) / (2 * len(cfg.protocol["train"]["sens_seeds"]))
++    assert per_seed == 9
++
++
++def test_smoke_config_is_small_and_isolated():
++    c = smoke_config(Config(), steps=8)
++    assert c.protocol["paths"]["results"] == "results_smoke"
++    sp = plan_specs(c)
++    assert len(sp["tune"]) == 16 and len(sp["main"]) == 16 and len(sp["sens"]) == 12
++    assert all(s.steps in (0, 8) for v in sp.values() for s in v)
++    assert Config().protocol["paths"]["results"] == "results"     # настоящий протокол не затронут
+diff --git a/tests/test_config_and_plans.py b/tests/test_config_and_plans.py
+index b8b8528..7eaf904 100644
+--- a/tests/test_config_and_plans.py
++++ b/tests/test_config_and_plans.py
+@@ -40,9 +40,10 @@ def test_missing_lock_blocks(tmp_path):
+ 
+ def test_plan_sizes(cfg):
+     assert len(OPTIMIZERS) == 8
+-    assert len(tune_specs(cfg)) == 8 * 7 * 2 == 112
++    n = 8 * 7 * len(cfg.protocol["train"]["tuning_seeds"])
++    assert len(tune_specs(cfg)) == n == 56
+     assert len(pilot_specs(cfg)) == 8
+-    assert len({s.run_id for s in tune_specs(cfg)}) == 112
++    assert len({s.run_id for s in tune_specs(cfg)}) == n
+ 
+ 
+ def test_lr_grids(cfg):

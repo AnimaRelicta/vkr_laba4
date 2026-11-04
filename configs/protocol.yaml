@@ -13,7 +13,8 @@ model:
     lora_dropout: 0.05
     lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
     max_len: 64
-    micro_batch: 16           # градиентная аккумуляция: эффективный batch = train.batch_size, память активаций в 4 раза меньше
+    micro_batch: 16           # градиентная аккумуляция: эффективный batch = train.batch_size. 32 не влезает в 8 ГБ RTX 4060 (уходит в общую память, всё замедляется): менять только после `lab4 bench`
+    eval_batch: 64            # батч при оценке (val/test): меньше пик памяти
     head_dropout: 0.2
     base_dtype: bfloat16      # база заморожена; LoRA-адаптеры и голова обучаются в FP32
   ngram:
@@ -25,20 +26,20 @@ model:
     dropout: 0.2
 train:
   batch_size: 64
-  steps: 600                  # ПРЕДЛОЖЕНИЕ, уточняется на пилоте и замораживается
+  steps: 80                   # ПРЕДЛОЖЕНИЕ (было 600; замер 0,825 с/шаг на RTX 4060), уточняется на пилоте и замораживается
   warmup_frac: 0.05
   scheduler: cosine
   grad_clip: 1.0
-  eval_every: 100             # val Macro-F1
-  log_every: 50               # train loss и норма градиента
+  eval_every: 10              # val Macro-F1
+  log_every: 20               # train loss и норма градиента
   target_val_f1: 0.90         # ПРЕДЛОЖЕНИЕ (ориентир из ТЗ), уточняется на пилоте
   copies_train: 4             # 1 исходная + 3 мутированные копии каждой колонки (мутации перебрасываются по seed)
   copies_val: 2
   copies_test: 3
-  tuning_seeds: [100, 101]
-  eval_seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-  sens_seeds: [0, 1, 2, 3, 4]
-  time_limit_min: 15          # лимит одного запуска (общий для всех оптимизаторов)
+  tuning_seeds: [100]
+  eval_seeds: [0, 1, 2, 3, 4]   # минимум по ТЗ: 5
+  sens_seeds: [0, 1]
+  time_limit_min: 5           # лимит одного запуска (общий для всех оптимизаторов)
 selection:
   max_unstable_share: 0.20
   weights: {f1: 0.40, std: 0.20, ece: 0.15, steps_to_target: 0.15, memory: 0.10}
