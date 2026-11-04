@@ -44,6 +44,9 @@ uv run lab4 --data data/demo/out passport
 # этап 2: паспорт данных, split.json, проверка утечек -> artifacts/
 uv run lab4 passport
 
+# сверка чисел ЛР1 (255/276 заголовков, 14/16 классов) -> artifacts/data_check.md
+uv run lab4 check-data --dir data/lab1/out --dir data/lab1/out_hard --llm-dir data/lab1/llm_out_hard
+
 # замер скорости на вашей карте и оценка времени всех этапов
 uv run lab4 bench --steps 30 --plan-steps 600
 

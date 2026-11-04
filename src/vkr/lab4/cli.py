@@ -59,6 +59,20 @@ def cmd_passport(args):
         sys.exit(1)
 
 
+def cmd_check_data(args):
+    from .verify import build_check
+    cfg = _cfg(args)
+    dirs = [Path(x) for x in (args.dir or [str(_data_dir(cfg))])]
+    dirs = [d if d.is_absolute() else ROOT / d for d in dirs]
+    llm = [Path(x) if Path(x).is_absolute() else ROOT / x for x in args.llm_dir]
+    md, summ = build_check(dirs, llm, args.claim_headers, args.claim_classes)
+    cfg.artifacts_dir.mkdir(parents=True, exist_ok=True)
+    out = cfg.artifacts_dir / "data_check.md"
+    out.write_text(md, encoding="utf-8")
+    print(md)
+    print(f"\nЗаписано: {out}")
+
+
 def cmd_freeze(args):
     p = CONFIG_DIR / "protocol.yaml"
     s = p.read_text(encoding="utf-8")
@@ -164,6 +178,11 @@ def main(argv=None):
     p = add("demo-data", cmd_demo_data, "создать СИНТЕТИЧЕСКИЕ данные для проверки конвейера")
     p.add_argument("--out", default="data/demo/out")
     add("passport", cmd_passport, "этап 2: паспорт данных, split.json, проверка утечек")
+    p = add("check-data", cmd_check_data, "сверка чисел ЛР1 (255/276 заголовков, 14/16 классов) по всем определениям")
+    p.add_argument("--dir", action="append", help="папка с observations*.csv (можно несколько, например out и out_hard)")
+    p.add_argument("--llm-dir", action="append", default=[], help="папка логов LLM ЛР1 с preds/*.jsonl (можно несколько)")
+    p.add_argument("--claim-headers", type=int, nargs="*", default=[255, 276])
+    p.add_argument("--claim-classes", type=int, nargs="*", default=[14, 16])
     p = add("freeze", cmd_freeze, "этап 3: заморозить число шагов и целевой F1, защитить configs хешем")
     p.add_argument("--steps", type=int, required=True)
     p.add_argument("--target", type=float, required=True)
