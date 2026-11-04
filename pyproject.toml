@@ -1,0 +1,52 @@
+[project]
+name = "vkr"
+version = "0.2.0"
+description = "ВКР: ЛР1 (сравнение LLM на маппинге колонок УПД) и ЛР4 (сравнение оптимизаторов)"
+readme = "README.md"
+authors = [
+    { name = "AnimaRelicta", email = "anima.relicta@gmail.com" }
+]
+# torch с CUDA-колёсами надёжнее всего ставится на 3.12/3.13, поэтому ограничение снижено с 3.14
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "bs4>=0.0.2",
+    "requests>=2.34.2",
+    # --- ЛР4 ---
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "scipy>=1.13",
+    "pyyaml>=6.0",
+    "matplotlib>=3.9",
+    "psutil>=6.0",
+    "torch>=2.6",
+    "transformers>=4.51",   # первая версия с Qwen3
+    "peft>=0.14",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+vkr = "vkr:main"
+lab4 = "vkr.lab4.cli:main"
+
+# На Windows и Linux torch с PyPI/по умолчанию может оказаться CPU-сборкой,
+# поэтому берём колёса CUDA 12.8 (подходят для RTX 4060, драйвер >= 570).
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[build-system]
+requires = ["uv_build>=0.12.22,<0.13.0"]
+build-backend = "uv_build"

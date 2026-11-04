@@ -1,0 +1,2653 @@
+diff --git a/.gitignore b/.gitignore
+index 505a3b1..cbe7a6d 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -8,3 +8,9 @@ wheels/
+ 
+ # Virtual environments
+ .venv
++
++# ЛР4: данные и результаты запусков (воспроизводятся командами из README)
++data/lab1/
++data/demo/
++results/
++.pytest_cache/
+diff --git a/.python-version b/.python-version
+index 6324d40..e4fba21 100644
+--- a/.python-version
++++ b/.python-version
+@@ -1 +1 @@
+-3.14
++3.12
+diff --git a/PROTOCOL.md b/PROTOCOL.md
+new file mode 100644
+index 0000000..66ef7c7
+--- /dev/null
++++ b/PROTOCOL.md
+@@ -0,0 +1,91 @@
++# PROTOCOL: протокол эксперимента ЛР4
++
++Статус: **ЧЕРНОВИК, не заморожен**. Пороги из ТЗ - предложение, их нужно подтвердить (см. TODO.md, раздел «Вопросы»).
++После `uv run lab4 freeze` значения в `configs/*.yaml` защищены хешем; менять их после первого основного запуска нельзя.
++Числовые значения живут в `configs/`, этот файл объясняет их смысл.
++
++## 1. Цель и вопрос
++
++Выбрать лучший из 8 оптимизаторов для классификатора «заголовок колонки -> каноническое поле УПД» и проверить, что
++выигрыш сохраняется в каскаде с LLM из ЛР1 (qwen/qwen3.8-flash, few-shot k=3, Macro-F1 0,9640, 5,56 ₽ за прогон).
++
++## 2. Модель и данные
++
++- Классы: 16 (`vkr/lab4/labels.py`: список LABELS из `run_llm_benchmark.py`). Расхождение «14 в таблице классов / 16 в метриках»
++  из отчёта ЛР1 снято в пользу 16; классы без объектов в gold в Macro-F1 не входят (как `f1_macro` в ЛР1).
++- Модель по умолчанию: **Qwen3-0.6B** (`Qwen/Qwen3-0.6B`), база заморожена и хранится в bf16, обучаются LoRA-адаптеры (r=16, все линейные слои)
++  и линейная голова в FP32. Вход в формате промпта ЛР1: `Заголовок: ...\nЗначения: ...`. Одинаковые обучаемые параметры у всех оптимизаторов.
++- Компактная модель из ТЗ (`--backend ngram`): хеши символьных n-грамм 2-5 -> EmbeddingBag -> скрытый слой 256 + dropout 0,2 -> softmax, плюс признаки значений
++  (доля цифр, длина, дробная часть); менее 1 млн параметров. Остаётся как быстрый CPU-базис, для тестов и сравнения «большая / маленькая модель».
++- Split: из ЛР1 как есть (`observations.csv`, колонка `split`), проверка утечек повторяется (`lab4 passport`).
++
++### Отступления от ТЗ (нужно подтвердить)
++
++| ТЗ | Что сделано | Почему |
++| --- | --- | --- |
++| модель менее 1 млн параметров, FP32 | Qwen3-0.6B + LoRA, обучаемое в FP32, база в bf16 | требование использовать небольшой Qwen на RTX 4060 8 ГБ; полный FP32 с Adam-состояниями (около 10 ГБ) не помещается |
++| batch size 64 | batch 64 как эффективный: 4 микробатча по 16 с накоплением градиента | память активаций; математика шага та же, dropout-маски другие |
++| «нестабильный запуск: loss вырос более чем в 3 раза от минимума» | считается по средним окнам из 50 шагов, не по отдельным батчам | шум мини-батча иначе даёт ложные срабатывания |
++
++## 3. Мутации и сценарии (`mutations.yaml`, `scenarios.yaml`)
++
++Мутации применяются после split. Семейства M3, M5, M6 в train не попадают; M5, M6 не попадают и в val (код выбрасывает `HoldoutViolation`).
++Train: исходная колонка + 3 мутированные копии (M1, M2, M4; мутации перебрасываются на каждый seed). Val и test мутируются фиксированным seed.
++Тестовый сценарий для метрик выбора - **MAIN** (все семейства, средние параметры; это моё предложение). S0-S5 считаются в каждом запуске.
++M5: заголовок режется посередине (или по « / » у двухуровневых) и либо склеивается, либо остаётся только нижний уровень.
++M6: перестановка col_label и лишняя колонка unmapped; модель позицию не использует, поэтому M6 влияет на test только добавленными колонками.
++S4 (смена шаблона): M5 p=0,5 на заголовок и M6 p=0,5 на документ (трактовка «p = 0,5 на документ» - уточнить).
++S5: цепь версий T0 (исходная), T1 (все заголовки сокращены), T2 (все заменены синонимами); документы по дате; остаёмся 0,8, иначе 0,1 / 0,1; 100 розыгрышей, старт в T0.
++
++## 4. Протокол запусков
++
++- Одинаковые: данные, архитектура, batch size, число шагов (**определяется пилотом и замораживается**), scheduler (cosine, warmup 5 %), clip 1,0, лимит времени на запуск.
++- Меняется только оптимизатор и его LR. Weight decay 0, кроме AdamW (0,01).
++- LR: 7 точек на логарифмической сетке (Adam-семейство, AdaGrad, RMSprop: 1e-4...1e-1; SGD-семейство: 1e-3...1,0); выбор по среднему val Macro-F1 на tuning-seed 100 и 101; при равенстве берётся меньший LR.
++- Оценка: seed 0-9. Seed управляет инициализацией головы и LoRA, порядком батчей, dropout и разбором мутаций train. Test-мутации и val фиксированы.
++- Логи: train loss и норма градиента каждые 50 шагов, val Macro-F1 каждые 100, финальные val/test, время (без оценок), пиковая память (GPU: max allocated; CPU: RSS), флаг нестабильности.
++- Объём: настройка 112, основной прогон 80, sensitivity около 180 запусков (топ-3 + SGD, 5 seed).
++
++## 5. Метрики и направления
++
++| Метрика | Лучше | Как считаем |
++| --- | --- | --- |
++| Macro-F1 на test (MAIN) | больше | среднее по 10 seed, bootstrap 95 % ДИ (10 000 перевыборок) |
++| Разброс F1 | меньше | стандартное отклонение по seed |
++| Шагов до целевого val F1 | меньше | первое из точек оценки (каждые 100 шагов), где val F1 >= цели; не достигнута - засчитывается весь бюджет шагов |
++| ECE | меньше | 15 бинов, top-1, test MAIN |
++| Время обучения | меньше | wall-clock без оценок; в балл не входит |
++| Пиковая память | меньше | см. выше |
++| Нестабильные запуски | меньше | NaN/inf, рост loss в 3 раза, цель не достигнута, превышение лимита времени, OOM |
++
++Целевой val F1: **0,90 (ориентир), будет уточнён пилотом и заморожен**.
++
++## 6. Правило выбора (не меняется после взгляда на результаты)
++
++1. Фильтр: не более 20 % нестабильных запусков (2 из 10).
++2. Сводный балл: 40 % F1, 20 % разброс, 15 % ECE, 15 % шаги до цели, 10 % память; каждая метрика нормируется min-max между 8 оптимизаторами с учётом направления (если метрика одинакова у всех, все получают 1).
++3. Pareto по F1, времени и разбросу: победитель не должен быть доминируемым.
++4. Bootstrap-ДИ по seed; парный Wilcoxon победителя с каждым другим с поправкой Холма. Если ДИ победителя и второго места пересекаются: «статистически неразличимы», выбор по нестабильности, затем памяти, затем времени.
++5. В выводе раздельно: скорость сходимости (шаги до цели), качество на val, качество на test.
++
++## 7. Гипотезы и пороги (предложение из ТЗ)
++
++| № | Гипотеза | Проверка |
++| --- | --- | --- |
++| H1 | Adam и AdamW достигают целевого val F1 минимум на 30 % быстрее по числу шагов, чем SGD без momentum | шаги до цели, 10 seed |
++| H2 | Разница Macro-F1 лучшего и худшего оптимизатора на test с мутациями не меньше 0,02, а 95 % ДИ лучшего и SGD не пересекаются | bootstrap, парный Wilcoxon |
++| H3 | Лучший по сводному баллу оптимизатор остаётся в топ-3 на S3-S5 | ранги по сценариям |
++| H4 | Каскад «классификатор + qwen3.8-flash» держит Macro-F1 не ниже 0,96 и вызывает LLM не более чем для 30 % колонок | этап 8 |
++
++Если H2 не подтвердится - допустимый результат: «различия в пределах шума», выбор по ресурсам и стабильности.
++
++## 8. Каскад (этап 8)
++
++1. Точное совпадение заголовка с эталоном - ответ без модели. 2. Иначе классификатор: max p >= τ и класс не unmapped. 3. Иначе LLM (few-shot k=3, промпт ЛР1).
++τ подбирается на val по кривой «доля вызовов LLM - Macro-F1» и не пересматривается после просмотра test. Критерий переноса (предложение): каскад с лучшим
++оптимизатором не хуже каскада с базовым по F1 (ДИ пересекаются или лучше), стоимость не более 50 % от «только LLM» при падении F1 не более 0,01.
++
++## 9. Бюджет и лимиты
++
++Лимит одного запуска: 15 минут чистого обучения (`train.time_limit_min`). Фактические часы зависят от карты: замерить `uv run lab4 bench` до пилота
++и записать сюда: _(заполнить)_.
+diff --git a/README.md b/README.md
+index 680cab2..7d73893 100644
+--- a/README.md
++++ b/README.md
+@@ -1,4 +1,103 @@
+-### Запуск проекта
++# ВКР: ЛР1 и ЛР4
++
++Проект на `uv` + `pyproject.toml`. Лабораторная 4 построена на данных и коде лабораторной 1 (код ЛР1 не менялся).
++Все изменения относительно ЛР1 записаны в **`patches/lab4.patch`** (см. «Патч» ниже).
++
++## ЛР4. Сравнение 8 оптимизаторов
++
++Задача: классификатор «заголовок колонки (+ до 3 значений) -> каноническое поле УПД» (16 классов).
++Обучаемая модель по умолчанию - **Qwen3-0.6B + LoRA** (влезает в 8 ГБ RTX 4060); запасной вариант - компактная
++модель из ТЗ (хеши n-грамм, менее 1 млн параметров, считается на CPU): `--backend ngram`.
++ТЗ и план: см. вложенные файлы задания; рабочие документы проекта: [PROTOCOL.md](PROTOCOL.md), [TODO.md](TODO.md).
++
++### Установка
++
++```bash
++# 1. драйвер NVIDIA (>= 570 для CUDA 12.8) и uv: https://docs.astral.sh/uv/
++uv sync                       # torch ставится из индекса cu128 (см. pyproject.toml)
++
++# 2. проверка GPU
++uv run python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
++
++# 3. тесты (тест test_torch_smoke.py сам пропускается, если torch не установлен)
++uv run pytest
++```
++
++Веса Qwen скачаются с Hugging Face при первом запуске (около 1,2 ГБ в кэш `~/.cache/huggingface`).
++Если на Windows `uv sync` поставил CPU-версию torch, `torch.cuda.is_available()` вернёт `False`: проверьте драйвер
++и что в `pyproject.toml` на месте блок `[[tool.uv.index]] pytorch-cu128`.
++
++### Данные
++
++Нужна папка `out/` из ЛР1 (результат `prepare_dataset.py`, файл `observations.csv`). Положите её в `data/lab1/out/`
++(путь меняется в `configs/protocol.yaml` или ключом `--data`). Без реальных данных конвейер можно проверить на
++**синтетических** данных (результаты на них в отчёт не идут):
++
++```bash
++uv run lab4 demo-data                         # создаёт data/demo/out
++uv run lab4 --data data/demo/out passport
++```
++
++### Порядок запуска (этапы плана)
++
++```bash
++# этап 2: паспорт данных, split.json, проверка утечек -> artifacts/
++uv run lab4 passport
++
++# замер скорости на вашей карте и оценка времени всех этапов
++uv run lab4 bench --steps 30 --plan-steps 600
++
++# этап 3: пилот (8 оптимизаторов, seed 0), затем заморозить число шагов и целевой F1
++uv run lab4 pilot
++uv run lab4 freeze --steps 600 --target 0.90      # после этого configs/*.yaml менять нельзя (protocol.lock.json)
++
++# этап 4: подбор LR (8 x 7 x 2 запуска) и выбор лучшего LR
++uv run lab4 tune
++uv run lab4 select-lr
++
++# этап 5: основной прогон (8 оптимизаторов x 10 seed, сценарии S0-S5 считаются в каждом запуске)
++uv run lab4 main
++
++# этап 6: статистика, сводный балл, гипотезы, графики -> results/<backend>/stats/report.md
++uv run lab4 stats
++
++# этап 7: sensitivity для топ-3 по баллу + SGD
++uv run lab4 sens
++
++uv run lab4 status                            # сколько запусков выполнено
++```
++
++Все команды возобновляемы: уже выполненные запуски (по `run_id`) пропускаются, поэтому прерывать и продолжать можно.
++Для проверки на CPU без Qwen добавьте `--backend ngram` (результаты складываются в `results/ngram/`, отдельно от `results/qwen/`).
++
++### Что где лежит
++
++| Путь | Что |
++| --- | --- |
++| `configs/protocol.yaml, grid.yaml, mutations.yaml, scenarios.yaml` | параметры эксперимента (замораживаются хешем) |
++| `src/vkr/lab4/` | код: `data`, `mutations`, `features`, `models`, `optimizers`, `train`, `runner`, `stats`, `report`, `cli` |
++| `artifacts/` | `data_passport.md`, `split.json` |
++| `results/<backend>/runs.csv` | одна строка на запуск: seed, параметры, метрики, время, память |
++| `results/<backend>/logs/` | кривые сходимости: train loss и норма градиента каждые 50 шагов, val F1 каждые 100 |
++| `results/<backend>/unstable_runs.csv` | журнал нестабильных запусков с причиной |
++| `results/<backend>/probs/` | вероятности классов на test (S0, S3, S4, MAIN) для каскада с LLM |
++| `tests/` | `uv run pytest` |
++
++### Патч
++
++`patches/lab4.patch` - все изменения относительно ЛР1 (git-тег `lab1-baseline`). Пересобрать после правок:
++
++```bash
++bash scripts/make_patch.sh
++```
++
++Применить к чистой копии ЛР1: `git apply patches/lab4.patch`.
++
++---
++
++# ЛР1 (исходное описание)
++
++### Запуск проекта ЛР1
+ 
+ ```bash
+ # синхронизация проекта и сопоставление зависимостей
+diff --git a/TODO.md b/TODO.md
+new file mode 100644
+index 0000000..df55f4e
+--- /dev/null
++++ b/TODO.md
+@@ -0,0 +1,80 @@
++# TODO: ЛР4 (статус на 2026-11-04)
++
++Легенда: [x] сделано и проверено; [~] код написан, но не запускался на реальных данных / GPU; [ ] не сделано.
++
++## Вопросы к вам (меняют план)
++
++- [ ] Данные ЛР1: положить `out/` (нужен `observations.csv`) в `data/lab1/out/`. В архиве репозитория данных нет, они на Google Drive.
++- [ ] Работа индивидуальная или групповая? В группе нужны роли, личные гипотезы и эксперименты.
++- [ ] Дедлайн и формат сдачи: отчёт .docx + репозиторий?
++- [ ] Подтвердить пороги H1-H4, правило выбора (раздел 6 PROTOCOL.md) и отступления от ТЗ (Qwen3-0.6B + LoRA вместо модели менее 1 млн параметров).
++- [ ] Сверить числа ЛР1: 255 и 276 заголовков в test, 14 и 16 классов (в проекте принято 16).
++
++## Этап 0. Подготовка (0,5 дня)
++
++- [x] Репозиторий ЛР1 взят за основу (git-тег `lab1-baseline`), изменения идут в `patches/lab4.patch`
++- [x] uv + pyproject.toml (torch из индекса cu128), README с командами
++- [x] Классы сведены к 16 (`labels.py`)
++- [~] PROTOCOL.md: черновик; заморозка командой `lab4 freeze` после пилота
++
++## Этап 1. Обзор литературы, 10-15 источников (2 дня)
++
++- [ ] Поиск и отбор источников (кандидаты и запрос Google Scholar: в «ТЗ и план», раздел 6.1). Ссылки в ТЗ не даны, каждый источник проверить и прочитать
++- [ ] Матрица (метод, допущения, данные, метрики, ограничения, связь с экспериментом)
++- [ ] Исследовательский разрыв (черновик есть в ТЗ, подтвердить после поиска)
++
++## Этап 2. Данные и мутации (1,5 дня)
++
++- [~] Паспорт данных и split.json: `lab4 passport` (проверено на демо-данных)
++- [~] Проверка утечек: контракты, продавцы, покупатели, кластеры, Jaccard >= 0,90 (приближение по values_sample, не по всем значениям)
++- [~] Мутации M1-M6 с hold-out семействами (14 тестов проходят, на реальных данных не смотрелись)
++- [ ] Просмотреть примеры мутаций на реальных заголовках и поправить словари (`configs/mutations.yaml`) ДО заморозки
++- [ ] Паспорт: сверить цифры с отчётом ЛР1 (unmapped 19,5 %, длина 41,8 и т.д.)
++
++## Этап 3. Модель и пилот (1 день)
++
++- [~] Qwen3-0.6B + LoRA и компактная n-gram модель, 8 оптимизаторов, общий цикл обучения (`train.py`). **Torch-код не запускался в среде разработки (нет GPU и доступа к PyPI/HF); первым делом `uv run pytest` и `uv run lab4 bench`**
++- [ ] `uv run lab4 bench`: замер с/шаг и память на RTX 4060, записать в PROTOCOL.md раздел 9
++- [ ] `uv run lab4 pilot` -> выбрать число шагов и целевой F1 -> `uv run lab4 freeze --steps N --target F`
++
++## Этап 4. Настройка LR (1 день)
++
++- [~] 112 запусков, выбор LR по val (`lab4 tune`, `lab4 select-lr`)
++- [ ] Выполнить на реальных данных
++
++## Этап 5. Основной прогон (1 день)
++
++- [~] 8 x 10 seed, логи, журнал нестабильных, сценарии S0-S5 в каждом запуске (`lab4 main`)
++- [ ] Выполнить
++
++## Этап 6. Статистика и выбор (1 день)
++
++- [x] ДИ bootstrap, Wilcoxon + Holm, сводный балл, Pareto, проверка H1-H3, графики (проверено на синтетическом runs.csv, `lab4 stats`)
++- [ ] Выполнить на реальных результатах
++
++## Этап 7. Стохастический анализ (2 дня)
++
++- [~] Sensitivity по LR, batch size, weight decay для топ-3 + SGD, 5 seed (`lab4 sens`)
++- [ ] rank-диаграмма и ширина «плато» по LR (графики по результатам sens)
++- [ ] Шум градиента на чекпоинте шага 500: 200 мини-батчей, batch 16/32/64/128 (параметры в `grid.yaml: noise`, кода пока нет)
++- [ ] Bootstrap по документам и leave-one-cluster-out для трёх финалистов
++- [ ] Карта источников случайности для отчёта
++- [x] Сценарии S0-S5 (S5: 100 розыгрышей цепи Маркова) считаются в каждом основном запуске
++
++## Этап 8. Перенос в ВКР: каскад (1,5 дня)
++
++- [ ] Каскад: точное совпадение -> классификатор (порог τ на val) -> LLM (промпт и вызов из `run_llm_benchmark.py`, нужен PROXY_API_KEY)
++- [ ] 4 варианта: только LLM / только классификатор / каскад с лучшим / каскад с базовым (SGD или Adam); метрики F1, доля вызовов LLM, ₽, задержка p50/p95 на S0 и S3-S5
++- [ ] Проверка H4 и критерия переноса. Вероятности классификатора на test сохраняются в `results/<backend>/probs/` (S0, S3, S4, MAIN)
++
++## Этап 9. Отчёт (2 дня)
++
++- [ ] .docx в порядке из задания: обзор, карта случайности, паспорт, 8 оптимизаторов, 10 seed, sensitivity, сценарии, перенос, вывод
++- [ ] Проверка, что все числа берутся из runs.csv
++- [ ] Прогнать текст на признаки ИИ (преподаватель строго относится)
++
++## Известные ограничения
++
++- 17 уникальных заголовков и 7 кластеров: ДИ по кластерам будут очень широкими (написать в угрозах валидности)
++- Мутации искусственные, не реальный дрейф; выводы опираются на S0, S1-S5 показывают устойчивость при оговорённых допущениях
++- На S0 все оптимизаторы, скорее всего, дадут F1 около 1; различия искать на S3-S5
+diff --git a/configs/grid.yaml b/configs/grid.yaml
+new file mode 100644
+index 0000000..9d972f2
+--- /dev/null
++++ b/configs/grid.yaml
+@@ -0,0 +1,23 @@
++# Сетка LR и параметры оптимизаторов. Одинаковая процедура для всех: 7 точек на лог-сетке,
++# выбор по среднему val Macro-F1 на двух tuning-seed (100, 101).
++optimizers:
++  sgd:      {family: sgd,  momentum: 0.0, nesterov: false, weight_decay: 0.0}
++  momentum: {family: sgd,  momentum: 0.9, nesterov: false, weight_decay: 0.0}
++  nesterov: {family: sgd,  momentum: 0.9, nesterov: true,  weight_decay: 0.0}
++  adagrad:  {family: adam, weight_decay: 0.0}
++  rmsprop:  {family: adam, alpha: 0.99, weight_decay: 0.0}
++  adam:     {family: adam, betas: [0.9, 0.999], weight_decay: 0.0}
++  adamw:    {family: adam, betas: [0.9, 0.999], weight_decay: 0.01}   # decoupled weight decay - суть метода
++  radam:    {family: adam, betas: [0.9, 0.999], weight_decay: 0.0}
++lr_grid:                       # 7 значений, логарифмическая сетка
++  adam: {min: 1.0e-4, max: 1.0e-1, n: 7}   # «Adam-семейство»: адаптивные методы
++  sgd:  {min: 1.0e-3, max: 1.0,    n: 7}   # «SGD-семейство»
++sensitivity:
++  optimizers_top: 3            # топ-3 по сводному баллу + SGD
++  lr_multipliers: [0.1, 0.3333333, 1.0, 3.0, 10.0]
++  batch_sizes: [16, 32, 64, 128]
++  weight_decays: [0.0, 1.0e-4, 1.0e-2]
++noise:
++  checkpoint_step: 500
++  n_batches: 200
++  batch_sizes: [16, 32, 64, 128]
+diff --git a/configs/mutations.yaml b/configs/mutations.yaml
+new file mode 100644
+index 0000000..32120fa
+--- /dev/null
++++ b/configs/mutations.yaml
+@@ -0,0 +1,108 @@
++# Семейства мутаций заголовков (ТЗ, п. 3.2). Мутации применяются ПОСЛЕ split.
++# Видимость: M3, M5, M6 не попадают в train; M5, M6 не попадают и в val (hold-out семейства).
++seeds: {train_base: 1000, val: 2000, test: 3000}   # train: base + seed запуска; val/test фиксированы для всех оптимизаторов
++visibility:
++  M1: [train, val, test]
++  M2: [train, val, test]
++  M3: [val, test]          # val видит только часть синонимов (val_syn), test - все
++  M4: [train, val, test]
++  M5: [test]
++  M6: [test]
++order: [M3, M2, M5, M1, M4]   # порядок применения к заголовку; M6 - на уровне документа после остальных
++M1:
++  char_probs: [0.03, 0.06, 0.10]
++  ops: [replace, delete, swap]
++M2:
++  # (подстрока, замена), регистр не важен; одна подходящая замена на заголовок + остальные с p=0.5
++  abbreviations:
++    - [количество, кол-во]
++    - [наименование, наим.]
++    - [единица измерения, ед. изм.]
++    - [стоимость, ст-ть]
++    - [налогом, нал.]
++    - [налога, нал.]
++    - [налоговая, нал.]
++    - [товаров, тов.]
++    - [страна, стр.]
++    - [происхождения, происх.]
++    - [условное обозначение, усл. обозн.]
++    - [национальное, нац.]
++    - [сумма, сум.]
++    - [цена, ц.]
++    - [порядку, пор.]
++    - [работ, раб.]
++    - [услуг, усл.]
++    - [описание, опис.]
++    - [предъявляемая, предъявл.]
++    - [покупателю, покуп.]
++    - [тариф, тар.]
++    - [акциза, акц.]
++    - [единицу, ед.]
++    - [номер, "№"]
++    - [объем, об.]
++    - [всего, вс.]
++M4:
++  p: 0.3
++  ops: [upper, lower, punct, spaces, newline, trailing]
++M5:
++  p: 0.2
++  modes: [glue, break]     # glue: «Стоимость / без НДС»; break: остаётся только нижний уровень шапки
++M6:
++  p_doc: 0.3
++  extra_columns:
++    - [Примечание, "б/н"]
++    - ["Вес, кг", "0.5"]
++    - [Серийный номер, "12/2026"]
++    - [Склад, "-"]
++    - [Номер партии, "2026-05-14"]
++    - [Штрихкод, "4607001234567"]
++# Синонимы по классам. val_syn видны в val и test; test_only - только в test.
++synonyms:
++  item_code:
++    val_syn: [Артикул, Код ТРУ, Код позиции]
++    test_only: [Код по КТРУ, ОКПД2, Код номенклатуры, Идентификатор товара]
++  row_number:
++    val_syn: [Номер строки, Порядковый номер]
++    test_only: ["№ пп", "Поз.", Строка, "N п/п"]
++  estimate_position:
++    val_syn: [Позиция сметы, Пункт сметы]
++    test_only: ["№ в смете", Шифр сметы, Код сметной позиции]
++  item_name:
++    val_syn: [Название товара, Товар]
++    test_only: [Предмет закупки, Номенклатура, Продукция, Наименование работ/услуг]
++  unit:
++    val_syn: [Измерение, Единицы]
++    test_only: [ЕИ, "Ед."]
++  unit_code:
++    val_syn: [Код ОКЕИ, Код по ОКЕИ]
++    test_only: [Цифровой код ЕИ, ОКЕИ код]
++  unit_name:
++    val_syn: [Обозначение ед. изм., Краткое наименование ЕИ]
++    test_only: [Усл. обозначение, Наименование единицы измерения]
++  quantity:
++    val_syn: [Объём, Число единиц]
++    test_only: [Объем поставки, Колич., "Количество, шт."]
++  price:
++    val_syn: [Стоимость единицы, Единичная цена]
++    test_only: [Цена за ед., "Цена единицы, руб.", Стоимость за единицу]
++  amount_without_vat:
++    val_syn: [Сумма без НДС, Стоимость без налога]
++    test_only: [Итого без НДС, Сумма (нетто), Всего без налога]
++  excise:
++    val_syn: [Акциз, Сумма акциза]
++    test_only: [Акцизный сбор, "Акциз, руб."]
++  vat_rate:
++    val_syn: [Ставка НДС, "НДС, %"]
++    test_only: [Ставка налога, "% НДС", "Ставка, %"]
++  vat_amount:
++    val_syn: [Сумма НДС, Сумма налога]
++    test_only: ["НДС, руб.", Размер НДС, НДС сумма]
++  total_with_vat:
++    val_syn: [Сумма с НДС, Итого с НДС]
++    test_only: [Всего к оплате, Сумма (брутто), К оплате, Стоимость с налогом]
++  country_of_origin:
++    val_syn: [Страна производитель, Страна изготовления]
++    test_only: [Происхождение, Страна, Страна происх.]
++  unmapped:
++    val_syn: [Комментарий, Склад]
++    test_only: [Гарантия, Срок годности, Производитель, Вес]
+diff --git a/configs/protocol.yaml b/configs/protocol.yaml
+new file mode 100644
+index 0000000..04a8abd
+--- /dev/null
++++ b/configs/protocol.yaml
+@@ -0,0 +1,56 @@
++# Единый источник параметров эксперимента. Человекочитаемая версия: PROTOCOL.md.
++# После `lab4 freeze` файлы configs/*.yaml защищены хешем (protocol.lock.json).
++frozen: false           # ставится командой lab4 freeze
++data:
++  dir: data/lab1/out          # папка результата prepare_dataset.py из ЛР1 (нужен observations.csv)
++  split_column: split         # берём split из ЛР1 как есть
++model:
++  backend: qwen               # qwen | ngram (ngram: компактная модель из ТЗ, быстрый CPU-базис и smoke-тесты)
++  qwen:
++    name: Qwen/Qwen3-0.6B     # ~0.6 млрд параметров, влезает в 8 ГБ RTX 4060 (запасной: Qwen/Qwen2.5-0.5B)
++    lora_r: 16
++    lora_alpha: 32
++    lora_dropout: 0.05
++    lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
++    max_len: 64
++    micro_batch: 16           # градиентная аккумуляция: эффективный batch = train.batch_size, память активаций в 4 раза меньше
++    head_dropout: 0.2
++    base_dtype: bfloat16      # база заморожена; LoRA-адаптеры и голова обучаются в FP32
++  ngram:
++    buckets: 32768
++    emb_dim: 24
++    ngram_min: 2
++    ngram_max: 5
++    hidden: 256
++    dropout: 0.2
++train:
++  batch_size: 64
++  steps: 600                  # ПРЕДЛОЖЕНИЕ, уточняется на пилоте и замораживается
++  warmup_frac: 0.05
++  scheduler: cosine
++  grad_clip: 1.0
++  eval_every: 100             # val Macro-F1
++  log_every: 50               # train loss и норма градиента
++  target_val_f1: 0.90         # ПРЕДЛОЖЕНИЕ (ориентир из ТЗ), уточняется на пилоте
++  copies_train: 4             # 1 исходная + 3 мутированные копии каждой колонки (мутации перебрасываются по seed)
++  copies_val: 2
++  copies_test: 3
++  tuning_seeds: [100, 101]
++  eval_seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
++  sens_seeds: [0, 1, 2, 3, 4]
++  time_limit_min: 15          # лимит одного запуска (общий для всех оптимизаторов)
++selection:
++  max_unstable_share: 0.20
++  weights: {f1: 0.40, std: 0.20, ece: 0.15, steps_to_target: 0.15, memory: 0.10}
++  bootstrap_resamples: 10000
++  ece_bins: 15
++hypotheses:
++  H1_min_speedup: 0.30        # Adam/AdamW быстрее SGD по шагам до цели минимум на 30 %
++  H2_min_gap: 0.02            # разрыв Macro-F1 лучший-худший на test с мутациями
++  H4_min_f1: 0.96
++  H4_max_llm_share: 0.30
++cascade:
++  max_cost_share: 0.50
++  max_f1_drop: 0.01
++paths:
++  results: results
+diff --git a/configs/scenarios.yaml b/configs/scenarios.yaml
+new file mode 100644
+index 0000000..3dfa2d0
+--- /dev/null
++++ b/configs/scenarios.yaml
+@@ -0,0 +1,28 @@
++# Сценарии меняют только test (ТЗ, п. 4.2). Параметры заданы явно.
++main_scenario: MAIN          # «test с мутациями» для метрик выбора (ПРЕДЛОЖЕНИЕ: средние параметры всех семейств)
++scenarios:
++  S0:   {desc: "Исходные заголовки (реальный тест)", mutations: {}}
++  S1:   {desc: "Лёгкий шум", mutations: {M1: {p_char: 0.03}, M4: {p: 0.3}}}
++  S2:   {desc: "Сильный шум", mutations: {M1: {p_char: 0.10}, M2: {p: 0.5}}}
++  S3:   {desc: "Переименование: большая часть синонимов не видела train", mutations: {M2: {p: 0.5}, M3: {p: 0.7}}}
++  S4:   {desc: "Смена шаблона (p = 0.5 на документ / заголовок)", mutations: {M5: {p: 0.5}, M6: {p_doc: 0.5}}}
++  MAIN: {desc: "Все семейства, средние параметры", mutations: {M1: {p_char: 0.06}, M2: {p: 0.3}, M3: {p: 0.5}, M4: {p: 0.3}, M5: {p: 0.2}, M6: {p_doc: 0.3}}}
++  S5:
++    desc: "Марковское переключение версий шаблона по документам в порядке даты"
++    markov:
++      draws: 100
++      start: T0
++      stay: 0.8                  # остаёмся; иначе одна из двух других версий по 0.1
++      versions:
++        T0: {}                                  # исходная
++        T1: {M2: {p: 1.0}}                      # сокращённая
++        T2: {M3: {p: 1.0}}                      # синонимичная
++train_mutations:                  # что видит train (параметры средние; seed перебрасывается на каждый запуск)
++  M1: {p_char: 0.06}
++  M2: {p: 0.3}
++  M4: {p: 0.3}
++val_mutations:
++  M1: {p_char: 0.06}
++  M2: {p: 0.3}
++  M3: {p: 0.4}                    # только val_syn
++  M4: {p: 0.3}
+diff --git a/pyproject.toml b/pyproject.toml
+index a6e0204..5a820b7 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,20 +1,51 @@
+ [project]
+ name = "vkr"
+-version = "0.1.0"
+-description = "Add your description here"
++version = "0.2.0"
++description = "ВКР: ЛР1 (сравнение LLM на маппинге колонок УПД) и ЛР4 (сравнение оптимизаторов)"
+ readme = "README.md"
+ authors = [
+     { name = "AnimaRelicta", email = "anima.relicta@gmail.com" }
+ ]
+-requires-python = ">=3.14"
++# torch с CUDA-колёсами надёжнее всего ставится на 3.12/3.13, поэтому ограничение снижено с 3.14
++requires-python = ">=3.12"
+ dependencies = [
+     "beautifulsoup4>=4.15.0",
+     "bs4>=0.0.2",
+     "requests>=2.34.2",
++    # --- ЛР4 ---
++    "numpy>=2.0",
++    "pandas>=2.2",
++    "scipy>=1.13",
++    "pyyaml>=6.0",
++    "matplotlib>=3.9",
++    "psutil>=6.0",
++    "torch>=2.6",
++    "transformers>=4.51",   # первая версия с Qwen3
++    "peft>=0.14",
+ ]
+ 
++[dependency-groups]
++dev = ["pytest>=8.0"]
++
+ [project.scripts]
+ vkr = "vkr:main"
++lab4 = "vkr.lab4.cli:main"
++
++# На Windows и Linux torch с PyPI/по умолчанию может оказаться CPU-сборкой,
++# поэтому берём колёса CUDA 12.8 (подходят для RTX 4060, драйвер >= 570).
++[[tool.uv.index]]
++name = "pytorch-cu128"
++url = "https://download.pytorch.org/whl/cu128"
++explicit = true
++
++[tool.uv.sources]
++torch = [
++    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
++]
++
++[tool.pytest.ini_options]
++testpaths = ["tests"]
++pythonpath = ["src"]
+ 
+ [build-system]
+ requires = ["uv_build>=0.12.22,<0.13.0"]
+diff --git a/scripts/make_patch.sh b/scripts/make_patch.sh
+new file mode 100755
+index 0000000..b7b17b4
+--- /dev/null
++++ b/scripts/make_patch.sh
+@@ -0,0 +1,9 @@
++#!/usr/bin/env bash
++# Собирает patches/lab4.patch: все изменения ЛР4 относительно ЛР1 (git-тег lab1-baseline), включая новые файлы.
++# Запуск из корня проекта:  bash scripts/make_patch.sh
++set -euo pipefail
++cd "$(dirname "$0")/.."
++git rev-parse lab1-baseline >/dev/null 2>&1 || { echo "Нет тега lab1-baseline: git tag lab1-baseline <коммит ЛР1>"; exit 1; }
++git add -N . >/dev/null 2>&1 || true
++git diff --binary lab1-baseline -- . ':(exclude)patches' > patches/lab4.patch
++echo "patches/lab4.patch: $(wc -l < patches/lab4.patch) строк, файлов: $(git diff --name-only lab1-baseline -- . ':(exclude)patches' | wc -l)"
+diff --git a/src/vkr/lab4/__init__.py b/src/vkr/lab4/__init__.py
+new file mode 100644
+index 0000000..1d58589
+--- /dev/null
++++ b/src/vkr/lab4/__init__.py
+@@ -0,0 +1 @@
++"""ЛР4: сравнение 8 оптимизаторов на классификаторе «заголовок колонки -> поле УПД»."""
+diff --git a/src/vkr/lab4/cli.py b/src/vkr/lab4/cli.py
+new file mode 100644
+index 0000000..4865ad1
+--- /dev/null
++++ b/src/vkr/lab4/cli.py
+@@ -0,0 +1,186 @@
++"""Командная строка ЛР4: `uv run lab4 <команда>`. Порядок команд описан в README.md."""
++from __future__ import annotations
++
++import argparse
++import re
++import sys
++from pathlib import Path
++
++from .config import CONFIG_DIR, ROOT, Config, check_lock, write_lock
++
++
++def _cfg(args) -> Config:
++    cfg = Config()
++    if getattr(args, "backend", None):
++        cfg.protocol["model"]["backend"] = args.backend
++    if getattr(args, "data", None):
++        cfg.protocol["data"]["dir"] = args.data
++    return cfg
++
++
++def _data_dir(cfg: Config) -> Path:
++    p = Path(cfg.protocol["data"]["dir"])
++    return p if p.is_absolute() else ROOT / p
++
++
++def _context(cfg: Config, steps: int | None = None):
++    """Тяжёлые импорты (torch) только здесь, чтобы passport/stats/status работали без GPU."""
++    import torch
++
++    from .data import load_observations, split_frames
++    from .models import make_backend
++    from .train import Context
++
++    if steps:
++        cfg.protocol["train"]["steps"] = steps
++    device = "cuda" if torch.cuda.is_available() else "cpu"
++    if device == "cpu" and cfg.backend == "qwen":
++        print("ВНИМАНИЕ: CUDA недоступна, Qwen будет считаться на CPU очень медленно. Проверьте установку torch (README, «Проверка GPU»).")
++    print(f"Устройство: {device}; модель: {cfg.backend}; данные: {_data_dir(cfg)}")
++    df = load_observations(_data_dir(cfg))
++    return Context(cfg, split_frames(df), make_backend(cfg.protocol), device)
++
++
++# ------------------------------------------------------------------ команды
++def cmd_demo_data(args):
++    from .demo_data import make_demo
++    out = make_demo(args.out)
++    print(f"Демо-данные (НЕ реальные!) записаны в {out}. Запуск: uv run lab4 passport --data {out}")
++
++
++def cmd_passport(args):
++    from .data import load_observations, write_passport
++    cfg = _cfg(args)
++    df = load_observations(_data_dir(cfg))
++    leaks = write_passport(df, cfg.artifacts_dir)
++    print(f"Записано: {cfg.artifacts_dir}/data_passport.md, split.json. Утечек нет: {leaks['clean']}")
++    if not leaks["clean"]:
++        print("ВНИМАНИЕ: проверка утечек не пройдена, подробности в split.json")
++        sys.exit(1)
++
++
++def cmd_freeze(args):
++    p = CONFIG_DIR / "protocol.yaml"
++    s = p.read_text(encoding="utf-8")
++    s = re.sub(r"(?m)^(  steps:\s*)\d+", rf"\g<1>{args.steps}", s, count=1)
++    s = re.sub(r"(?m)^(  target_val_f1:\s*)[0-9.]+", rf"\g<1>{args.target}", s, count=1)
++    s = re.sub(r"(?m)^frozen:\s*\w+", "frozen: true", s, count=1)
++    p.write_text(s, encoding="utf-8")
++    print(f"Протокол заморожен: steps={args.steps}, target_val_f1={args.target}, sha256={write_lock()[:16]}…")
++    print("Дальше configs/*.yaml менять нельзя; запишите значения в PROTOCOL.md.")
++
++
++def cmd_bench(args):
++    import time
++
++    import torch
++
++    from .optimizers import OPTIMIZERS
++    cfg = _cfg(args)
++    ctx = _context(cfg)
++    n, plan_default = args.steps, cfg.protocol["train"]["steps"]
++    cfg.protocol["train"].update({"steps": n, "eval_every": 10**9, "target_val_f1": 2.0})
++    from .spec import RunSpec
++    from .train import train_run
++    t0 = time.perf_counter()
++    row = train_run(RunSpec("bench", "adamw", 1e-3, 0, steps=n), ctx, None, eval_scenarios=False)
++    dt = time.perf_counter() - t0
++    per = row["train_time_s"] / max(1, row["steps_done"])
++    t = cfg.protocol["train"]
++    plan = {"tuning (112)": len(OPTIMIZERS) * 7 * len(t["tuning_seeds"]), "main (80)": len(OPTIMIZERS) * len(t["eval_seeds"]), "sensitivity (~180)": 180}
++    print(f"{per:.3f} с/шаг, пиковая память {row['peak_mem_mb']:.0f} МБ, обучаемых параметров {row['n_trainable']:,} (всего {dt:.1f} с на {n} шагов)")
++    steps = args.plan_steps or plan_default
++    for k, v in plan.items():
++        print(f"  {k}: {v} запусков x {steps} шагов ≈ {v * steps * per / 3600:.1f} ч (без оценки на val/test)")
++
++
++def cmd_pilot(args):
++    from .runner import execute, pilot_specs, runs_path
++    cfg = _cfg(args)
++    ctx = _context(cfg, args.steps)
++    runs_path(cfg, "pilot_runs.csv").unlink(missing_ok=True)
++    execute(pilot_specs(cfg), ctx, eval_scenarios=False, fname="pilot_runs.csv")
++    print(f"Готово: {runs_path(cfg, 'pilot_runs.csv')}, кривые в results/{cfg.backend}/logs/pilot. "
++          "Выберите steps и target_val_f1 и выполните `uv run lab4 freeze --steps N --target F`.")
++
++
++def cmd_tune(args):
++    from .runner import execute, tune_specs
++    cfg = _cfg(args)
++    check_lock()
++    execute(tune_specs(cfg), _context(cfg), eval_scenarios=False)
++
++
++def cmd_select_lr(args):
++    from .runner import select_lr
++    cfg = _cfg(args)
++    for o, lr in select_lr(cfg).items():
++        print(f"{o:9s} lr={lr:.4g}")
++
++
++def cmd_main(args):
++    from .runner import execute, main_specs
++    cfg = _cfg(args)
++    check_lock()
++    execute(main_specs(cfg), _context(cfg), eval_scenarios=True, save_probs=True)
++
++
++def cmd_sens(args):
++    from .runner import execute, sens_specs, top_for_sensitivity
++    cfg = _cfg(args)
++    check_lock()
++    opts = top_for_sensitivity(cfg)
++    print("Sensitivity для:", opts)
++    execute(sens_specs(cfg, opts), _context(cfg), eval_scenarios=True)
++
++
++def cmd_stats(args):
++    from .report import build_report
++    from .runner import read_runs
++    cfg = _cfg(args)
++    print("Отчёт:", build_report(cfg, read_runs(cfg)))
++
++
++def cmd_status(args):
++    from .runner import read_runs, runs_path
++    cfg = _cfg(args)
++    runs = read_runs(cfg)
++    print(f"{runs_path(cfg)}: {len(runs)} запусков")
++    if len(runs):
++        print(runs.groupby(["phase", "optimizer"]).size().unstack(fill_value=0).to_string())
++
++
++def main(argv=None):
++    ap = argparse.ArgumentParser(prog="lab4", description=__doc__)
++    ap.add_argument("--backend", choices=["qwen", "ngram"], help="модель (по умолчанию из configs/protocol.yaml)")
++    ap.add_argument("--data", help="папка с observations.csv (по умолчанию из protocol.yaml)")
++    sub = ap.add_subparsers(dest="cmd", required=True)
++
++    def add(name, fn, help_):
++        p = sub.add_parser(name, help=help_)
++        p.set_defaults(fn=fn)
++        return p
++
++    p = add("demo-data", cmd_demo_data, "создать СИНТЕТИЧЕСКИЕ данные для проверки конвейера")
++    p.add_argument("--out", default="data/demo/out")
++    add("passport", cmd_passport, "этап 2: паспорт данных, split.json, проверка утечек")
++    p = add("freeze", cmd_freeze, "этап 3: заморозить число шагов и целевой F1, защитить configs хешем")
++    p.add_argument("--steps", type=int, required=True)
++    p.add_argument("--target", type=float, required=True)
++    p = add("bench", cmd_bench, "замер секунд/шаг и оценка времени всех этапов")
++    p.add_argument("--steps", type=int, default=30)
++    p.add_argument("--plan-steps", type=int, default=0)
++    p = add("pilot", cmd_pilot, "этап 3: 8 оптимизаторов на одном seed")
++    p.add_argument("--steps", type=int, default=0, help="переопределить число шагов только для пилота")
++    add("tune", cmd_tune, "этап 4: подбор LR (8 x 7 x 2 запуска)")
++    add("select-lr", cmd_select_lr, "выбрать LR по результатам tune")
++    add("main", cmd_main, "этап 5: 8 оптимизаторов x 10 seed + сценарии S0-S5")
++    add("sens", cmd_sens, "этап 7: sensitivity (LR, batch size, weight decay)")
++    add("stats", cmd_stats, "этап 6: статистика, сводный балл, гипотезы, графики")
++    add("status", cmd_status, "сколько запусков выполнено")
++    args = ap.parse_args(argv)
++    args.fn(args)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/vkr/lab4/config.py b/src/vkr/lab4/config.py
+new file mode 100644
+index 0000000..f92eabb
+--- /dev/null
++++ b/src/vkr/lab4/config.py
+@@ -0,0 +1,75 @@
++"""Загрузка конфигов и защита протокола хешем (протокол не меняется после заморозки)."""
++from __future__ import annotations
++
++import hashlib
++import json
++from pathlib import Path
++
++import yaml
++
++ROOT = Path(__file__).resolve().parents[3]
++CONFIG_DIR = ROOT / "configs"
++LOCKED_FILES = ["protocol.yaml", "grid.yaml", "mutations.yaml", "scenarios.yaml"]
++LOCK_PATH = ROOT / "protocol.lock.json"
++
++
++def load_yaml(name: str, config_dir: Path | None = None) -> dict:
++    with open((config_dir or CONFIG_DIR) / name, encoding="utf-8") as f:
++        return yaml.safe_load(f)
++
++
++class Config:
++    def __init__(self, config_dir: Path | None = None):
++        self.dir = config_dir or CONFIG_DIR
++        self.protocol = load_yaml("protocol.yaml", self.dir)
++        self.grid = load_yaml("grid.yaml", self.dir)
++        self.mutations = load_yaml("mutations.yaml", self.dir)
++        self.scenarios = load_yaml("scenarios.yaml", self.dir)
++
++    @property
++    def backend(self) -> str:
++        return self.protocol["model"]["backend"]
++
++    @property
++    def results_dir(self) -> Path:
++        """Результаты разных моделей не смешиваются: results/<backend>/."""
++        return ROOT / self.protocol["paths"]["results"] / self.backend
++
++    @property
++    def artifacts_dir(self) -> Path:
++        return ROOT / "artifacts"
++
++
++def _normalized(path: Path) -> bytes:
++    """Хеш не должен зависеть от флага frozen и переводов строк."""
++    data = yaml.safe_load(path.read_text(encoding="utf-8"))
++    if path.name == "protocol.yaml":
++        data = {k: v for k, v in data.items() if k != "frozen"}
++    return json.dumps(data, sort_keys=True, ensure_ascii=False).encode()
++
++
++def protocol_hash(config_dir: Path | None = None) -> str:
++    d = config_dir or CONFIG_DIR
++    h = hashlib.sha256()
++    for name in LOCKED_FILES:
++        h.update(name.encode())
++        h.update(_normalized(d / name))
++    return h.hexdigest()
++
++
++def write_lock(config_dir: Path | None = None, lock_path: Path | None = None) -> str:
++    digest = protocol_hash(config_dir)
++    (lock_path or LOCK_PATH).write_text(json.dumps({"sha256": digest, "files": LOCKED_FILES}, indent=1), encoding="utf-8")
++    return digest
++
++
++def check_lock(config_dir: Path | None = None, lock_path: Path | None = None) -> None:
++    """Бросает RuntimeError, если протокол заморожен и после этого менялся."""
++    lp = lock_path or LOCK_PATH
++    if not lp.exists():
++        raise RuntimeError("Протокол не заморожен: сначала `uv run lab4 freeze --steps N --target F`.")
++    locked = json.loads(lp.read_text(encoding="utf-8"))["sha256"]
++    if locked != protocol_hash(config_dir):
++        raise RuntimeError(
++            "configs/*.yaml изменены после заморозки протокола (protocol.lock.json). "
++            "Верните значения или заморозьте заново и явно отметьте это в отчёте.")
+diff --git a/src/vkr/lab4/data.py b/src/vkr/lab4/data.py
+new file mode 100644
+index 0000000..d5d7c20
+--- /dev/null
++++ b/src/vkr/lab4/data.py
+@@ -0,0 +1,157 @@
++"""Данные ЛР1: загрузка observations.csv, split.json, проверка утечек, паспорт данных."""
++from __future__ import annotations
++
++import json
++from collections import Counter, defaultdict
++from pathlib import Path
++
++import numpy as np
++import pandas as pd
++
++from .labels import LABELS
++
++REQUIRED = ["split", "doc_ref", "cluster_id", "header_text", "values_sample", "label"]
++OPTIONAL = ["contract_id", "seller_id", "buyer_id", "doc_date", "n_rows", "n_values", "n_numeric", "col_label"]
++
++
++def load_observations(data_dir: str | Path) -> pd.DataFrame:
++    """Читает out/observations.csv (результат prepare_dataset.py из ЛР1)."""
++    p = Path(data_dir) / "observations.csv"
++    if not p.exists():
++        raise FileNotFoundError(
++            f"{p} не найден. Положите папку out/ из ЛР1 в data/lab1/out "
++            "(или создайте демо-данные: uv run lab4 demo-data).")
++    df = pd.read_csv(p, encoding="utf-8-sig", dtype=str, keep_default_na=False)
++    missing = [c for c in REQUIRED if c not in df.columns]
++    if missing:
++        raise ValueError(f"В observations.csv нет колонок: {missing}")
++    for c in OPTIONAL:
++        if c not in df.columns:
++            df[c] = ""
++    unknown = sorted(set(df["label"]) - set(LABELS))
++    if unknown:
++        raise ValueError(f"Неизвестные классы в данных: {unknown}. Список классов: vkr.lab4.labels.LABELS")
++    df["cluster_id"] = df["cluster_id"].astype(str)
++    df["col_label"] = pd.to_numeric(df["col_label"], errors="coerce").fillna(0).astype(int)
++    df = df.sort_values(["split", "doc_ref", "col_label"], kind="stable").reset_index(drop=True)
++    return df
++
++
++def split_frames(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
++    return {s: df[df["split"] == s].reset_index(drop=True) for s in ("train", "val", "test")}
++
++
++def doc_tokens(df: pd.DataFrame) -> dict[str, set]:
++    """Токены документа для Jaccard (как в prepare_dataset: заголовки и значения с меткой класса)."""
++    toks: dict[str, set] = defaultdict(set)
++    for r in df.itertuples():
++        toks[r.doc_ref].add(f"H|{r.label}|{r.header_text}")
++        for v in filter(None, (x.strip().lower() for x in r.values_sample.split(" | "))):
++            toks[r.doc_ref].add(f"V|{r.label}|{v[:200]}")
++    return toks
++
++
++def leak_report(df: pd.DataFrame, jaccard_thr: float = 0.90) -> dict:
++    """Повторная проверка утечек между train/val/test (ТЗ, п. 3.1)."""
++    doc_split = df.drop_duplicates("doc_ref").set_index("doc_ref")["split"]
++    rep: dict = {}
++    for key in ("contract_id", "seller_id", "buyer_id"):
++        sub = df[df[key] != ""].drop_duplicates(["doc_ref"])
++        where = sub.groupby(key)["split"].nunique()
++        rep[key] = {"values": int(len(where)), "in_several_splits": int((where > 1).sum())}
++    clusters = df.drop_duplicates("doc_ref").groupby("cluster_id")["split"].nunique()
++    rep["cluster_id"] = {"values": int(len(clusters)), "in_several_splits": int((clusters > 1).sum())}
++    toks = doc_tokens(df)
++    docs = list(toks)
++    cross = 0
++    near = 0
++    for i in range(len(docs)):
++        for j in range(i + 1, len(docs)):
++            a, b = toks[docs[i]], toks[docs[j]]
++            if len(a & b) / max(len(a | b), 1) >= jaccard_thr:
++                near += 1
++                cross += doc_split[docs[i]] != doc_split[docs[j]]
++    rep["near_duplicate_pairs"] = {"threshold": jaccard_thr, "pairs": near, "across_splits": int(cross)}
++    rep["clean"] = all(rep[k]["in_several_splits"] == 0 for k in ("contract_id", "seller_id", "buyer_id", "cluster_id")) and cross == 0
++    return rep
++
++
++def split_json(df: pd.DataFrame, leaks: dict) -> dict:
++    docs = df.drop_duplicates("doc_ref")
++    out = {"source": "ЛР1 (observations.csv), split не пересчитывался", "leak_check": leaks, "parts": {}}
++    for s in ("train", "val", "test"):
++        d = docs[docs["split"] == s]
++        out["parts"][s] = {
++            "documents": int(len(d)), "observations": int((df["split"] == s).sum()),
++            "clusters": sorted(d["cluster_id"].unique().tolist()), "doc_refs": sorted(d["doc_ref"].tolist()),
++        }
++    return out
++
++
++def _share(a, b) -> str:
++    return f"{100 * a / b:.1f} %" if b else "n/a"
++
++
++def _md(head, rows) -> str:
++    out = ["| " + " | ".join(head) + " |", "| " + " | ".join("---" for _ in head) + " |"]
++    out += ["| " + " | ".join(str(x) for x in r) + " |" for r in rows]
++    return "\n".join(out)
++
++
++def passport(df: pd.DataFrame, leaks: dict) -> str:
++    """Паспорт данных заново по ТЗ, п. 3.1: классы, длина заголовков, пропуски, дубликаты шаблонов, время."""
++    n = len(df)
++    docs = df.drop_duplicates("doc_ref")
++    L = df["header_text"].str.len()
++    P = ["# Паспорт данных (ЛР4)\n",
++         f"Источник: observations.csv из ЛР1. Документов: {len(docs)}, колонок: {n}, "
++         f"уникальных заголовков: {df['header_text'].nunique()}.\n",
++         "## Классы\n",
++         _md(["Класс", "Наблюдений", "Доля"], [[k, v, _share(v, n)] for k, v in Counter(df["label"]).most_common()]),
++         "\nКлассы из LABELS без наблюдений: " + (", ".join(sorted(set(LABELS) - set(df["label"]))) or "нет") + "\n",
++         "## Длина заголовка, символов\n",
++         f"среднее {L.mean():.1f}, медиана {L.median():.1f}, мин {L.min()}, макс {L.max()}\n",
++         "## Пропуски значений\n"]
++    miss = []
++    for lab, g in df.groupby("label"):
++        cells = pd.to_numeric(g["n_rows"], errors="coerce").sum()
++        vals = pd.to_numeric(g["n_values"], errors="coerce").sum()
++        miss.append([lab, int(cells), int(cells - vals), _share(cells - vals, cells)])
++    P += [_md(["Класс", "Ячеек", "Пустых", "Доля пустых"], miss), "\n",
++          "## Дубликаты шаблонов\n"]
++    sig = df.groupby("doc_ref")["header_text"].apply(lambda s: "|".join(s))
++    sc = Counter(sig)
++    P += [f"Различных наборов заголовков (шаблонов) среди документов: {len(sc)}; "
++          f"самый частый используют {max(sc.values())} из {len(sig)} документов.\n"]
++    dup = df.duplicated(["header_text", "values_sample", "label"]).sum()
++    P += [f"Полностью одинаковых (заголовок, значения, класс) колонок: {dup} из {n} ({_share(dup, n)}). "
++          "Из-за этого без мутаций модель просто запоминает заголовки.\n", "## Временная структура\n"]
++    dd = docs[docs["doc_date"] != ""]
++    if len(dd):
++        P += [f"Период: {dd['doc_date'].min()} - {dd['doc_date'].max()}.\n",
++              _md(["Месяц", "Документов"], sorted(Counter(dd["doc_date"].str[:7]).items())), "\n"]
++    else:
++        P += ["Даты документов в данных отсутствуют.\n"]
++    P += ["## Разбиение (из ЛР1)\n",
++          _md(["Часть", "Документов", "Колонок", "Кластеров"],
++              [[s, int((docs["split"] == s).sum()), int((df["split"] == s).sum()),
++                docs.loc[docs["split"] == s, "cluster_id"].nunique()] for s in ("train", "val", "test")]),
++          "\n## Проверка утечек\n",
++          _md(["Проверка", "Результат", "Ожидание"],
++              [["контракты в нескольких частях", f"{leaks['contract_id']['in_several_splits']} из {leaks['contract_id']['values']}", "0"],
++               ["продавцы в нескольких частях", f"{leaks['seller_id']['in_several_splits']} из {leaks['seller_id']['values']}", "0"],
++               ["покупатели в нескольких частях", f"{leaks['buyer_id']['in_several_splits']} из {leaks['buyer_id']['values']}", "0"],
++               ["кластеры в нескольких частях", f"{leaks['cluster_id']['in_several_splits']} из {leaks['cluster_id']['values']}", "0"],
++               [f"почти одинаковые пары (Jaccard ≥ {leaks['near_duplicate_pairs']['threshold']}) между частями",
++                f"{leaks['near_duplicate_pairs']['across_splits']} (всего пар: {leaks['near_duplicate_pairs']['pairs']})", "0"]]),
++          "\nJaccard считается по заголовкам и до 3 значений из values_sample, поэтому это приближение проверки из ЛР1 "
++          "(там использовались все значения колонки).\n"]
++    return "\n".join(P)
++
++
++def write_passport(df: pd.DataFrame, out_dir: Path) -> dict:
++    out_dir.mkdir(parents=True, exist_ok=True)
++    leaks = leak_report(df)
++    (out_dir / "data_passport.md").write_text(passport(df, leaks), encoding="utf-8")
++    (out_dir / "split.json").write_text(json.dumps(split_json(df, leaks), ensure_ascii=False, indent=1), encoding="utf-8")
++    return leaks
+diff --git a/src/vkr/lab4/demo_data.py b/src/vkr/lab4/demo_data.py
+new file mode 100644
+index 0000000..e4f4309
+--- /dev/null
++++ b/src/vkr/lab4/demo_data.py
+@@ -0,0 +1,58 @@
++"""Синтетический аналог out/observations.csv из ЛР1: ТОЛЬКО для проверки конвейера.
++
++Повторяет структуру из отчёта ЛР1 (116 документов, 17 колонок на документ, 7 кластеров, split 80/18/18,
++февраль-октябрь 2026), но заголовки и значения придуманы. Результаты на этих данных в отчёт не идут.
++"""
++from __future__ import annotations
++
++import random
++from pathlib import Path
++
++import pandas as pd
++
++# 17 колонок документа: по одной на 12 классов + 2 страны + 3 unmapped
++COLUMNS = [
++    ("row_number", "№ п/п", "1 | 2"),
++    ("item_code", "код товара/ работы, услуги", "01.11.11 | 10.20.14"),
++    ("item_name", "наименование товара (описание выполненных работ, оказанных услуг), имущественного права", "Молоко | Крупа"),
++    ("unmapped", "дополнительные данные", ""),
++    ("unit_code", "единица измерения / код", "796 | 166"),
++    ("unit_name", "единица измерения / условное обозначение (национальное)", "шт | кг"),
++    ("quantity", "количество (объем)", "10 | 25"),
++    ("price", "цена (тариф) за единицу измерения", "120.50 | 80.00"),
++    ("amount_without_vat", "стоимость товаров (работ, услуг), имущественных прав без налога - всего", "1205.00 | 2000.00"),
++    ("excise", "в том числе сумма акциза", "без акциза"),
++    ("vat_rate", "налоговая ставка", "20% | 10%"),
++    ("vat_amount", "сумма налога, предъявляемая покупателю", "241.00 | 200.00"),
++    ("total_with_vat", "стоимость товаров (работ, услуг), имущественных прав с налогом - всего", "1446.00 | 2200.00"),
++    ("country_of_origin", "страна происхождения товара / цифровой код", "643 | 156"),
++    ("country_of_origin", "страна происхождения товара / краткое наименование", "россия | китай"),
++    ("unmapped", "номер таможенной декларации", ""),
++    ("unmapped", "примечание", "-"),
++]
++CLUSTER_SIZES = [44, 20, 16, 18, 10, 6, 2]   # 7 кластеров, 116 документов
++CLUSTER_SPLIT = ["train", "train", "train", "val", "test", "test", "test"]   # 80 / 18 / 18
++
++
++def make_demo(out_dir: str | Path, seed: int = 42) -> Path:
++    rnd = random.Random(seed)
++    rows = []
++    doc_no = 0
++    for cid, (size, split) in enumerate(zip(CLUSTER_SIZES, CLUSTER_SPLIT)):
++        for _ in range(size):
++            doc_no += 1
++            month = rnd.randint(2, 10)
++            date = f"2026-{month:02d}-{rnd.randint(1, 28):02d}"
++            contract = f"c_{cid}_{rnd.randint(0, 3)}"   # контракты не пересекают кластеры, значит и части
++            for k, (lab, header, vals) in enumerate(COLUMNS, start=1):
++                vals_c = f"{vals} | k{cid}" if vals else ""   # значения зависят от кластера, как у реальных шаблонов
++                rows.append({
++                    "obs_id": len(rows), "split": split, "doc_ref": f"d_{doc_no:04d}", "cluster_id": cid,
++                    "form_type": "УПД", "template_id": "demo", "col_label": k, "header_raw": header, "header_text": header,
++                    "values_sample": vals_c, "n_rows": 2, "n_values": 2 if vals else 0, "n_numeric": 2 if vals and vals[0].isdigit() else 0,
++                    "label": lab, "header_artifact": 0, "contract_id": contract, "seller_id": f"s_{cid}", "buyer_id": f"b_{cid}",
++                    "doc_date": date, "year_month": date[:7]})
++    out = Path(out_dir)
++    out.mkdir(parents=True, exist_ok=True)
++    pd.DataFrame(rows).to_csv(out / "observations.csv", index=False, encoding="utf-8-sig")
++    return out
+diff --git a/src/vkr/lab4/features.py b/src/vkr/lab4/features.py
+new file mode 100644
+index 0000000..2c56c56
+--- /dev/null
++++ b/src/vkr/lab4/features.py
+@@ -0,0 +1,36 @@
++"""Признаки без torch: хеш символьных n-грамм заголовка и признаки значений (для компактной модели ngram)."""
++from __future__ import annotations
++
++import re
++import zlib
++
++_WS = re.compile(r"\s+")
++_FRAC = re.compile(r"\d[.,]\d")
++
++
++def normalize(text: str) -> str:
++    """Для ngram-модели: регистр и пробелы нормализуются (как в ЛР1, где заголовки приводились к нижнему регистру)."""
++    return _WS.sub(" ", text.casefold()).strip()
++
++
++def ngram_ids(text: str, buckets: int, nmin: int = 2, nmax: int = 5) -> list[int]:
++    """Хешированные символьные n-граммы (стабильный crc32, не зависит от PYTHONHASHSEED)."""
++    t = f"<{normalize(text)}>"
++    ids = []
++    for n in range(nmin, nmax + 1):
++        for i in range(len(t) - n + 1):
++            ids.append(zlib.crc32(t[i:i + n].encode("utf-8")) % buckets)
++    return ids or [0]
++
++
++def value_features(values: str) -> list[float]:
++    """Доля цифр, длина (нормирована, не больше 1), наличие дробной части."""
++    s = values.replace(" | ", "").replace(" ", "")
++    n = len(s)
++    digits = sum(c.isdigit() for c in s)
++    return [digits / n if n else 0.0, min(n / 100.0, 1.0), 1.0 if _FRAC.search(values) else 0.0]
++
++
++def qwen_text(header: str, values: str) -> str:
++    """Формат входа Qwen совпадает с промптом v0 из ЛР1."""
++    return f"Заголовок: {header}\nЗначения: {values or '—'}"
+diff --git a/src/vkr/lab4/labels.py b/src/vkr/lab4/labels.py
+new file mode 100644
+index 0000000..229b458
+--- /dev/null
++++ b/src/vkr/lab4/labels.py
+@@ -0,0 +1,15 @@
++"""Единый список классов.
++
++В отчёте ЛР1 расхождение: в таблице классов 14 строк, в метриках zero-shot 16
++(добавлены estimate_position и unit). Для ЛР4 берём 16 классов из LABELS в
++run_llm_benchmark.py: это тот же набор, который видели LLM, и он нужен для каскада.
++Классы без объектов в gold не входят в Macro-F1 (так же считает f1_macro в ЛР1).
++"""
++
++LABELS = [
++    "item_code", "row_number", "estimate_position", "item_name", "unit", "unit_code", "unit_name",
++    "quantity", "price", "amount_without_vat", "excise", "vat_rate", "vat_amount", "total_with_vat",
++    "country_of_origin", "unmapped",
++]
++LABEL2ID = {l: i for i, l in enumerate(LABELS)}
++N_CLASSES = len(LABELS)
+diff --git a/src/vkr/lab4/metrics.py b/src/vkr/lab4/metrics.py
+new file mode 100644
+index 0000000..bf376ff
+--- /dev/null
++++ b/src/vkr/lab4/metrics.py
+@@ -0,0 +1,29 @@
++"""Метрики без torch: Macro-F1 (как в ЛР1: по классам, встречающимся в gold) и ECE."""
++from __future__ import annotations
++
++import numpy as np
++
++
++def macro_f1(y_true, y_pred) -> float:
++    y_true, y_pred = np.asarray(y_true), np.asarray(y_pred)
++    fs = []
++    for c in np.unique(y_true):
++        tp = np.sum((y_true == c) & (y_pred == c))
++        fp = np.sum((y_true != c) & (y_pred == c))
++        fn = np.sum((y_true == c) & (y_pred != c))
++        fs.append(2 * tp / (2 * tp + fp + fn) if (tp + fp + fn) else 0.0)
++    return float(np.mean(fs))
++
++
++def ece(probs: np.ndarray, y_true, n_bins: int = 15) -> float:
++    """Expected Calibration Error по уверенности top-1, равноширокие бины."""
++    probs, y_true = np.asarray(probs), np.asarray(y_true)
++    conf, pred = probs.max(1), probs.argmax(1)
++    correct = (pred == y_true).astype(float)
++    edges = np.linspace(0.0, 1.0, n_bins + 1)
++    total = 0.0
++    for lo, hi in zip(edges[:-1], edges[1:]):
++        m = (conf > lo) & (conf <= hi) if lo > 0 else (conf >= lo) & (conf <= hi)
++        if m.any():
++            total += m.mean() * abs(correct[m].mean() - conf[m].mean())
++    return float(total)
+diff --git a/src/vkr/lab4/models.py b/src/vkr/lab4/models.py
+new file mode 100644
+index 0000000..03b437f
+--- /dev/null
++++ b/src/vkr/lab4/models.py
+@@ -0,0 +1,129 @@
++"""Модели и их «бэкенды» (кодирование входа + сборка модели). Единственный модуль с классами nn.Module.
++
++ngram - компактная модель из ТЗ (<1 млн параметров, считается на CPU);
++qwen  - небольшой Qwen с LoRA и классификационной головой, помещается в 8 ГБ (RTX 4060).
++Оптимизаторы обучают одни и те же обучаемые параметры: LoRA-адаптеры + голова (всё в FP32).
++"""
++from __future__ import annotations
++
++import numpy as np
++import torch
++from torch import nn
++
++from .features import ngram_ids, qwen_text, value_features
++from .labels import N_CLASSES
++
++
++class NgramBag(nn.Module):
++    """EmbeddingBag по хешам n-грамм -> concat(признаки значений) -> Linear(hidden) -> ReLU -> Dropout -> Linear."""
++
++    def __init__(self, buckets: int, emb_dim: int, hidden: int, dropout: float, n_value_feats: int = 3):
++        super().__init__()
++        self.emb = nn.EmbeddingBag(buckets, emb_dim, mode="mean")
++        self.net = nn.Sequential(nn.Linear(emb_dim + n_value_feats, hidden), nn.ReLU(), nn.Dropout(dropout),
++                                 nn.Linear(hidden, N_CLASSES))
++
++    def forward(self, ids, offsets, vf):
++        return self.net(torch.cat([self.emb(ids, offsets), vf], dim=1))
++
++
++class QwenClassifier(nn.Module):
++    """Qwen (заморожен, bf16) + LoRA (FP32) -> усреднение по токенам -> Dropout -> Linear."""
++
++    def __init__(self, qcfg: dict):
++        super().__init__()
++        from peft import LoraConfig, get_peft_model
++        from transformers import AutoModel
++
++        dtype = getattr(torch, qcfg["base_dtype"]) if torch.cuda.is_available() else torch.float32
++        base = AutoModel.from_pretrained(qcfg["name"], torch_dtype=dtype)
++        lcfg = LoraConfig(r=qcfg["lora_r"], lora_alpha=qcfg["lora_alpha"], lora_dropout=qcfg["lora_dropout"],
++                          target_modules=qcfg["lora_targets"], bias="none")
++        self.backbone = get_peft_model(base, lcfg)
++        for p in self.backbone.parameters():     # обучаемое (LoRA) держим в FP32
++            if p.requires_grad:
++                p.data = p.data.float()
++        hidden = base.config.hidden_size
++        self.drop = nn.Dropout(qcfg["head_dropout"])
++        self.head = nn.Linear(hidden, N_CLASSES)
++
++    def forward(self, input_ids, attention_mask):
++        h = self.backbone(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
++        m = attention_mask.unsqueeze(-1).to(h.dtype)
++        pooled = (h * m).sum(1) / m.sum(1).clamp(min=1)
++        return self.head(self.drop(pooled.float()))
++
++
++class NgramBackend:
++    name = "ngram"
++
++    def __init__(self, cfg: dict):
++        self.c = cfg["model"]["ngram"]
++        self.micro_batch = None
++        self._cache: dict = {}
++
++    def encode_one(self, header: str, values: str):
++        k = (header, values)
++        it = self._cache.get(k)
++        if it is None:
++            it = (ngram_ids(header, self.c["buckets"], self.c["ngram_min"], self.c["ngram_max"]), value_features(values))
++            self._cache[k] = it
++        return it
++
++    def collate(self, items, device):
++        lens = [len(it[0]) for it in items]
++        offsets = np.concatenate([[0], np.cumsum(lens)[:-1]])
++        return {"ids": torch.tensor([i for it in items for i in it[0]], dtype=torch.long, device=device),
++                "offsets": torch.tensor(offsets, dtype=torch.long, device=device),
++                "vf": torch.tensor([it[1] for it in items], dtype=torch.float32, device=device)}
++
++    def build_model(self, seed: int):
++        torch.manual_seed(seed)
++        return NgramBag(self.c["buckets"], self.c["emb_dim"], self.c["hidden"], self.c["dropout"])
++
++
++class QwenBackend:
++    name = "qwen"
++
++    def __init__(self, cfg: dict):
++        from transformers import AutoTokenizer
++
++        self.q = cfg["model"]["qwen"]
++        self.micro_batch = self.q.get("micro_batch", 16)
++        self.tok = AutoTokenizer.from_pretrained(self.q["name"])
++        self.pad_id = self.tok.pad_token_id if self.tok.pad_token_id is not None else 0
++        self._cache: dict = {}
++
++    def encode_one(self, header: str, values: str):
++        k = (header, values)
++        it = self._cache.get(k)
++        if it is None:
++            it = self.tok(qwen_text(header, values), truncation=True, max_length=self.q["max_len"])["input_ids"]
++            self._cache[k] = it
++        return it
++
++    def collate(self, items, device):
++        L = max(len(x) for x in items)
++        ids = torch.full((len(items), L), self.pad_id, dtype=torch.long)
++        mask = torch.zeros((len(items), L), dtype=torch.long)
++        for i, x in enumerate(items):
++            ids[i, :len(x)] = torch.tensor(x)
++            mask[i, :len(x)] = 1
++        return {"input_ids": ids.to(device), "attention_mask": mask.to(device)}
++
++    def build_model(self, seed: int):
++        torch.manual_seed(seed)
++        return QwenClassifier(self.q)
++
++
++def make_backend(cfg: dict, name: str | None = None):
++    name = name or cfg["model"]["backend"]
++    if name == "ngram":
++        return NgramBackend(cfg)
++    if name == "qwen":
++        return QwenBackend(cfg)
++    raise KeyError(name)
++
++
++def n_trainable(model: nn.Module) -> int:
++    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+diff --git a/src/vkr/lab4/mutations.py b/src/vkr/lab4/mutations.py
+new file mode 100644
+index 0000000..d428d67
+--- /dev/null
++++ b/src/vkr/lab4/mutations.py
+@@ -0,0 +1,239 @@
++"""Мутации заголовков M1-M6 (ТЗ, п. 3.2) и сценарии S0-S5 (п. 4.2).
++
++Главное правило: M3, M5, M6 нельзя применять к train, M5 и M6 нельзя применять к val.
++Нарушение приводит к ValueError (hold-out семейства проверяют обобщение, а не память).
++Все случайные решения идут из переданного np.random.Generator, поэтому результат воспроизводим по seed.
++"""
++from __future__ import annotations
++
++import re
++
++import numpy as np
++import pandas as pd
++
++RU_LOWER = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
++EN_LOWER = "abcdefghijklmnopqrstuvwxyz"
++FAMILY_KEYS = ["M1", "M2", "M3", "M4", "M5", "M6"]
++
++
++class HoldoutViolation(ValueError):
++    pass
++
++
++def check_visibility(spec: dict, split: str, mut_cfg: dict) -> None:
++    for fam in spec:
++        if split not in mut_cfg["visibility"][fam]:
++            raise HoldoutViolation(f"Семейство {fam} не должно применяться к {split} (visibility в mutations.yaml)")
++
++
++# ---------------------------------------------------------------- отдельные семейства
++def _alphabet(ch: str) -> str | None:
++    lo = ch.lower()
++    if lo in RU_LOWER:
++        return RU_LOWER
++    if lo in EN_LOWER:
++        return EN_LOWER
++    return None
++
++
++def m1_typos(text: str, p_char: float, ops: list[str], rng: np.random.Generator) -> str:
++    """Опечатки: замена, пропуск, перестановка соседних символов; p_char - вероятность на букву."""
++    chars = list(text)
++    i = 0
++    while i < len(chars):
++        ch = chars[i]
++        alpha = _alphabet(ch)
++        if alpha is not None and rng.random() < p_char:
++            op = ops[rng.integers(len(ops))]
++            if op == "replace":
++                new = alpha[rng.integers(len(alpha))]
++                chars[i] = new.upper() if ch.isupper() else new
++            elif op == "delete" and len(chars) > 1:
++                del chars[i]
++                continue
++            elif op == "swap" and i + 1 < len(chars) and chars[i + 1].isalpha():
++                chars[i], chars[i + 1] = chars[i + 1], chars[i]
++                i += 1
++        i += 1
++    return "".join(chars)
++
++
++def m2_abbreviate(text: str, pairs: list, rng: np.random.Generator) -> str:
++    """Сокращения: первая подходящая замена обязательна, остальные с p = 0.5."""
++    out, first = text, True
++    for sub, rep in pairs:
++        pat = re.compile(re.escape(sub), re.I)
++        if pat.search(out) and (first or rng.random() < 0.5):
++            out, first = pat.sub(rep, out, count=1), False
++    return out
++
++
++def m3_synonym(label: str, pool: dict, rng: np.random.Generator) -> str | None:
++    cands = pool.get(label) or []
++    return cands[rng.integers(len(cands))] if cands else None
++
++
++def m4_format(text: str, ops: list[str], rng: np.random.Generator) -> str:
++    """Регистр, пунктуация, пробелы, переносы: применяются 1-2 случайные операции."""
++    out = text
++    for op in rng.choice(ops, size=int(rng.integers(1, 3)), replace=False):
++        if op == "upper":
++            out = out.upper()
++        elif op == "lower":
++            out = out.lower()
++        elif op == "punct":
++            new = re.sub(r"[()\-,./]", " ", out)
++            out = new if new != out else out + ":"
++        elif op == "spaces":
++            out = " ".join(["", out, ""]) if rng.random() < 0.3 else re.sub(r" ", lambda m: "  " if rng.random() < 0.5 else " ", out)
++        elif op == "newline":
++            idx = [m.start() for m in re.finditer(" ", out)]
++            if idx:
++                k = idx[rng.integers(len(idx))]
++                out = out[:k] + "\n" + out[k + 1:]
++        elif op == "trailing":
++            out = out + str(rng.choice([":", ".", ";"]))
++    return out
++
++
++def m5_two_level(text: str, modes: list[str], rng: np.random.Generator) -> str:
++    """Двухуровневая шапка: склейка верхнего и нижнего уровня либо потеря верхнего уровня."""
++    if " / " in text:
++        up, low = text.split(" / ", 1)
++        glued = f"{up} {low}"          # исходный разделитель теряется
++    else:
++        words = text.split()
++        if len(words) < 2:
++            return text
++        k = len(words) // 2
++        up, low = " ".join(words[:k]), " ".join(words[k:])
++        glued = f"{up} / {low}"
++    mode = modes[rng.integers(len(modes))]
++    return glued if mode == "glue" else low
++
++
++# ---------------------------------------------------------------- применение к таблице
++def synonym_pool(mut_cfg: dict, split: str) -> dict:
++    """Какие синонимы видит часть: train - никаких, val - val_syn, test - val_syn + test_only."""
++    pool = {}
++    for lab, d in mut_cfg["synonyms"].items():
++        if split == "train":
++            pool[lab] = []
++        elif split == "val":
++            pool[lab] = list(d["val_syn"])
++        else:
++            pool[lab] = list(d["val_syn"]) + list(d["test_only"])
++    return pool
++
++
++def mutate_frame(df: pd.DataFrame, spec: dict, split: str, mut_cfg: dict, rng: np.random.Generator) -> pd.DataFrame:
++    """Одна мутированная копия df. spec: {семейство: параметры}. Добавляет header_orig, mut (теги применённых семейств)."""
++    check_visibility(spec, split, mut_cfg)
++    out = df.copy()
++    out["header_orig"] = out["header_text"]
++    tags = [[] for _ in range(len(out))]
++    headers = out["header_text"].tolist()
++    labels = out["label"].tolist()
++    pool = synonym_pool(mut_cfg, split)
++    for fam in mut_cfg["order"]:
++        if fam not in spec or fam == "M6":
++            continue
++        prm = spec[fam]
++        for i in range(len(headers)):
++            if fam == "M1":
++                new = m1_typos(headers[i], prm["p_char"], mut_cfg["M1"]["ops"], rng)
++            elif fam == "M2":
++                if rng.random() >= prm["p"]:
++                    continue
++                new = m2_abbreviate(headers[i], mut_cfg["M2"]["abbreviations"], rng)
++            elif fam == "M3":
++                if rng.random() >= prm["p"]:
++                    continue
++                new = m3_synonym(labels[i], pool, rng) or headers[i]
++            elif fam == "M4":
++                if rng.random() >= prm["p"]:
++                    continue
++                new = m4_format(headers[i], mut_cfg["M4"]["ops"], rng)
++            elif fam == "M5":
++                if rng.random() >= prm["p"]:
++                    continue
++                new = m5_two_level(headers[i], mut_cfg["M5"]["modes"], rng)
++            else:
++                raise KeyError(fam)
++            if new != headers[i]:
++                headers[i] = new
++                tags[i].append(fam)
++    out["header_text"] = headers
++    out["mut"] = ["+".join(t) for t in tags]
++    if "M6" in spec:
++        out = m6_doc_level(out, spec["M6"]["p_doc"], mut_cfg, rng)
++    return out
++
++
++def m6_doc_level(df: pd.DataFrame, p_doc: float, mut_cfg: dict, rng: np.random.Generator) -> pd.DataFrame:
++    """Перестановка колонок и лишняя колонка: с вероятностью p_doc на документ.
++
++    Классификатор не использует позицию, поэтому перестановка меняет только col_label (важна для каскада и правил
++    «точное совпадение»). Лишняя колонка добавляет объект класса unmapped."""
++    extras = mut_cfg["M6"]["extra_columns"]
++    parts, new_rows = [], []
++    for doc, g in df.groupby("doc_ref", sort=False):
++        g = g.copy()
++        if rng.random() < p_doc:
++            g["col_label"] = rng.permutation(g["col_label"].to_numpy())
++            g["mut"] = g["mut"].map(lambda t: (t + "+M6").lstrip("+"))
++            h, v = extras[rng.integers(len(extras))]
++            row = g.iloc[-1].copy()
++            row.update({"header_text": h, "header_orig": h, "values_sample": v, "label": "unmapped",
++                        "col_label": int(g["col_label"].max()) + 1, "mut": "M6+extra"})
++            new_rows.append(row)
++        parts.append(g)
++    res = pd.concat(parts + ([pd.DataFrame(new_rows)] if new_rows else []), ignore_index=True)
++    return res.sort_values(["doc_ref", "col_label"], kind="stable").reset_index(drop=True)
++
++
++def build_set(df: pd.DataFrame, spec: dict, split: str, mut_cfg: dict, seed: int, copies: int,
++              keep_original: bool) -> pd.DataFrame:
++    """copies копий df; при keep_original первая копия - без мутаций, остальные мутированы независимыми розыгрышами."""
++    rng = np.random.default_rng(seed)
++    parts = []
++    for c in range(copies):
++        if keep_original and c == 0:
++            part = df.copy()
++            part["header_orig"], part["mut"] = part["header_text"], ""
++        else:
++            part = mutate_frame(df, spec, split, mut_cfg, rng)
++        part["copy"] = c
++        parts.append(part)
++    return pd.concat(parts, ignore_index=True)
++
++
++# ---------------------------------------------------------------- S5: марковское переключение версий
++def markov_chain(n_docs: int, stay: float, versions: list[str], start: str, rng: np.random.Generator) -> list[str]:
++    """Цепь версий шаблона по документам: остаёмся с вероятностью stay, иначе одна из остальных поровну."""
++    state, out = start, []
++    for _ in range(n_docs):
++        out.append(state)
++        if rng.random() >= stay:
++            others = [v for v in versions if v != state]
++            state = others[rng.integers(len(others))]
++    return out
++
++
++def markov_frames(test_df: pd.DataFrame, scen: dict, mut_cfg: dict, seed: int):
++    """Генератор мутированных test-таблиц: по одной на розыгрыш цепи. Документы упорядочены по doc_date, затем по doc_ref."""
++    m = scen["markov"]
++    docs = (test_df.drop_duplicates("doc_ref").sort_values(["doc_date", "doc_ref"])["doc_ref"].tolist())
++    versions = list(m["versions"])
++    rng = np.random.default_rng(seed)
++    for _ in range(m["draws"]):
++        chain = markov_chain(len(docs), m["stay"], versions, m["start"], rng)
++        by_version = dict(zip(docs, chain))
++        parts = []
++        for ver in versions:
++            sub = test_df[test_df["doc_ref"].map(by_version) == ver]
++            if len(sub):
++                spec = m["versions"][ver]
++                parts.append(mutate_frame(sub, spec, "test", mut_cfg, rng) if spec else
++                             sub.assign(header_orig=sub["header_text"], mut=""))
++        yield pd.concat(parts, ignore_index=True), chain
+diff --git a/src/vkr/lab4/optimizers.py b/src/vkr/lab4/optimizers.py
+new file mode 100644
+index 0000000..e2b3a15
+--- /dev/null
++++ b/src/vkr/lab4/optimizers.py
+@@ -0,0 +1,32 @@
++"""Фабрика 8 оптимизаторов (torch.optim, без внешних зависимостей) по configs/grid.yaml."""
++from __future__ import annotations
++
++import numpy as np
++
++OPTIMIZERS = ["sgd", "momentum", "nesterov", "adagrad", "rmsprop", "adam", "adamw", "radam"]
++
++
++def lr_grid(grid_cfg: dict, optimizer: str) -> list[float]:
++    """7 значений LR на логарифмической сетке для семейства оптимизатора."""
++    g = grid_cfg["lr_grid"][grid_cfg["optimizers"][optimizer]["family"]]
++    return [float(x) for x in np.logspace(np.log10(g["min"]), np.log10(g["max"]), g["n"])]
++
++
++def make_optimizer(name: str, params, lr: float, grid_cfg: dict, weight_decay: float | None = None):
++    import torch
++
++    o = grid_cfg["optimizers"][name]
++    wd = o.get("weight_decay", 0.0) if weight_decay is None else weight_decay
++    if name in ("sgd", "momentum", "nesterov"):
++        return torch.optim.SGD(params, lr=lr, momentum=o["momentum"], nesterov=o["nesterov"], weight_decay=wd)
++    if name == "adagrad":
++        return torch.optim.Adagrad(params, lr=lr, weight_decay=wd)
++    if name == "rmsprop":
++        return torch.optim.RMSprop(params, lr=lr, alpha=o.get("alpha", 0.99), weight_decay=wd)
++    if name == "adam":
++        return torch.optim.Adam(params, lr=lr, betas=tuple(o["betas"]), weight_decay=wd)
++    if name == "adamw":
++        return torch.optim.AdamW(params, lr=lr, betas=tuple(o["betas"]), weight_decay=wd)
++    if name == "radam":
++        return torch.optim.RAdam(params, lr=lr, betas=tuple(o["betas"]), weight_decay=wd)
++    raise KeyError(name)
+diff --git a/src/vkr/lab4/report.py b/src/vkr/lab4/report.py
+new file mode 100644
+index 0000000..6de2f69
+--- /dev/null
++++ b/src/vkr/lab4/report.py
+@@ -0,0 +1,84 @@
++"""Сборка results/stats/*: таблицы, проверка гипотез, графики. Читает только runs.csv и logs/."""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pandas as pd
++
++from . import stats as S
++
++
++def _plots(main: pd.DataFrame, logs_dir: Path, out: Path) -> list[str]:
++    import matplotlib
++    matplotlib.use("Agg")
++    import matplotlib.pyplot as plt
++
++    made = []
++    opts = sorted(main["optimizer"].unique())
++    fig, ax = plt.subplots(figsize=(8, 4.5))
++    ax.boxplot([pd.to_numeric(main.loc[main.optimizer == o, "test_f1_main"], errors="coerce").dropna() for o in opts], tick_labels=opts)
++    ax.set_ylabel("Macro-F1, test с мутациями")
++    ax.set_title("Распределение итоговой метрики по seed")
++    fig.tight_layout()
++    fig.savefig(out / "f1_boxplot.png", dpi=150)
++    plt.close(fig)
++    made.append("f1_boxplot.png")
++    curves: dict = {o: [] for o in opts}
++    for rid, o in zip(main["run_id"], main["optimizer"]):
++        p = logs_dir / "main" / f"{rid}.jsonl"
++        if p.exists():
++            pts = [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines() if l]
++            curves[o].append(pd.Series({x["step"]: x["val_f1"] for x in pts if "val_f1" in x}))
++    if any(curves.values()):
++        fig, ax = plt.subplots(figsize=(8, 4.5))
++        for o, lst in curves.items():
++            if lst:
++                m = pd.concat(lst, axis=1).mean(axis=1)
++                ax.plot(m.index, m.values, label=o)
++        ax.set_xlabel("шаг")
++        ax.set_ylabel("val Macro-F1 (среднее по seed)")
++        ax.legend(ncol=2, fontsize=8)
++        fig.tight_layout()
++        fig.savefig(out / "convergence.png", dpi=150)
++        plt.close(fig)
++        made.append("convergence.png")
++    return made
++
++
++def build_report(cfg, runs: pd.DataFrame) -> Path:
++    out = cfg.results_dir / "stats"
++    out.mkdir(parents=True, exist_ok=True)
++    main = runs[runs["phase"] == "main"].copy()
++    if main.empty:
++        raise SystemExit("В runs.csv нет запусков фазы main.")
++    sel, tcfg = cfg.protocol["selection"], cfg.protocol["train"]
++    summary = S.summarize(main, sel, tcfg["steps"])
++    score = S.composite(summary, sel["weights"])
++    choice = S.choose_winner(summary, score, sel["max_unstable_share"])
++    table = choice["table"].sort_values("score", ascending=False)
++    scen_names = [k for k in cfg.scenarios["scenarios"]]
++    scen = S.scenario_table(main, scen_names)
++    hyp = S.hypotheses(summary, scen, choice["winner"], cfg.protocol["hypotheses"], main)
++    table.to_csv(out / "summary.csv", encoding="utf-8-sig")
++    scen.to_csv(out / "scenarios.csv", encoding="utf-8-sig")
++    lines = ["# Сравнение оптимизаторов (авто-отчёт из runs.csv)\n",
++             f"Запусков main: {len(main)}, оптимизаторов: {main['optimizer'].nunique()}, seed на оптимизатор: "
++             f"{main.groupby('optimizer')['seed'].nunique().min()}-{main.groupby('optimizer')['seed'].nunique().max()}.\n",
++             "## Сводная таблица (test с мутациями, сценарий MAIN)\n", S.fmt_table(table), "\n",
++             f"## Выбор\n\nФильтр: не более {sel['max_unstable_share']:.0%} нестабильных запусков.\n",
++             f"Победитель по сводному баллу: **{choice['winner']}**. Вердикт: {choice['verdict']}.\n",
++             f"Итоговый выбор оптимизатора: **{choice.get('final')}**.\n"]
++    if choice["winner"]:
++        w = S.pairwise_wilcoxon(main, choice["winner"])
++        w.to_csv(out / "wilcoxon_holm.csv", encoding="utf-8-sig")
++        lines += [f"Парный Wilcoxon {choice['winner']} против остальных (по seed, Holm):\n", S.fmt_table(w.rename_axis("optimizer")), "\n"]
++    lines += ["## Сценарии S0-S5 (средний Macro-F1, ранг, падение к S0)\n", S.fmt_table(scen), "\n",
++              "## Гипотезы\n"] + [f"- {h['h']}: {h['value']} -> {'подтверждена' if h['ok'] else 'не подтверждена' if h['ok'] is False else 'ожидает этапа 8'}" for h in hyp]
++    unstable = main[main["unstable"].astype(str).isin(["1", "True", "1.0"])]
++    keep = [c for c in ("run_id", "optimizer", "seed", "lr", "unstable_reason", "steps_done") if c in unstable.columns]
++    unstable[keep].to_csv(out / "unstable_main.csv", index=False, encoding="utf-8-sig")   # полный журнал всех фаз: results/<backend>/unstable_runs.csv
++    figs = _plots(main, cfg.results_dir / "logs", out)
++    lines += ["\n## Графики\n"] + [f"- stats/{f}" for f in figs]
++    (out / "report.md").write_text("\n".join(lines), encoding="utf-8")
++    return out / "report.md"
+diff --git a/src/vkr/lab4/runner.py b/src/vkr/lab4/runner.py
+new file mode 100644
+index 0000000..351dd2e
+--- /dev/null
++++ b/src/vkr/lab4/runner.py
+@@ -0,0 +1,145 @@
++"""Планы запусков (pilot / tune / main / sens), запись runs.csv, возобновление после обрыва."""
++from __future__ import annotations
++
++import csv
++import json
++import math
++import time
++from pathlib import Path
++
++import pandas as pd
++
++from .optimizers import OPTIMIZERS, lr_grid
++from .spec import RunSpec
++
++SCEN_COLS = ["S0", "S1", "S2", "S3", "S4", "MAIN"]
++FIELDS = (["run_id", "phase", "optimizer", "lr", "seed", "batch_size", "weight_decay", "steps", "steps_done", "backend",
++           "n_trainable", "val_f1_final", "val_f1_best", "steps_to_target", "unstable", "unstable_reason", "final_loss",
++           "train_time_s", "peak_mem_mb"]
++          + [f"test_f1_{s}" for s in SCEN_COLS] + ["test_f1_S5", "test_f1_S5_sd"] + [f"test_ece_{s}" for s in SCEN_COLS]
++          + ["test_f1_main", "test_ece_main"])
++
++
++def runs_path(cfg, fname: str = "runs.csv") -> Path:
++    return cfg.results_dir / fname
++
++
++def read_runs(cfg, fname: str = "runs.csv") -> pd.DataFrame:
++    p = runs_path(cfg, fname)
++    return pd.read_csv(p, encoding="utf-8-sig") if p.exists() else pd.DataFrame(columns=FIELDS)
++
++
++def _append(cfg, row: dict, fname: str = "runs.csv") -> None:
++    p = runs_path(cfg, fname)
++    p.parent.mkdir(parents=True, exist_ok=True)
++    new = not p.exists()
++    with open(p, "a", newline="", encoding="utf-8-sig") as f:
++        w = csv.DictWriter(f, FIELDS, extrasaction="ignore", restval="")
++        if new:
++            w.writeheader()
++        w.writerow(row)
++
++
++def execute(specs: list[RunSpec], ctx, eval_scenarios: bool, save_probs: bool = False, fname: str = "runs.csv") -> None:
++    from .train import train_run
++
++    cfg = ctx.cfg
++    done = set(read_runs(cfg, fname)["run_id"]) if runs_path(cfg, fname).exists() else set()
++    todo = [s for s in specs if s.run_id not in done]
++    print(f"Запусков в плане: {len(specs)}, уже выполнено: {len(specs) - len(todo)}, осталось: {len(todo)}")
++    t0 = time.time()
++    for i, spec in enumerate(todo, 1):
++        try:
++            row = train_run(spec, ctx, cfg.results_dir / "logs" / spec.phase, eval_scenarios,
++                            cfg.results_dir / "probs" if save_probs else None)
++        except RuntimeError as e:   # CUDA OOM и подобное: фиксируем как нестабильный запуск, идём дальше
++            if "out of memory" not in str(e).lower():
++                raise
++            import torch
++            torch.cuda.empty_cache()
++            row = {**spec.__dict__, "run_id": spec.run_id, "unstable": 1, "unstable_reason": "oom", "backend": ctx.backend.name}
++        _append(cfg, row, fname)
++        if row.get("unstable"):
++            up = cfg.results_dir / "unstable_runs.csv"
++            new = not up.exists()
++            with open(up, "a", newline="", encoding="utf-8-sig") as f:
++                w = csv.writer(f)
++                if new:
++                    w.writerow(["run_id", "optimizer", "seed", "lr", "unstable_reason", "steps_done"])
++                w.writerow([row["run_id"], spec.optimizer, spec.seed, spec.lr, row.get("unstable_reason"), row.get("steps_done", "")])
++        el = time.time() - t0
++        print(f"[{i}/{len(todo)}] {spec.run_id}: val_f1={row.get('val_f1_final', float('nan')):.4f} "
++              f"unstable={row.get('unstable_reason') or '-'}  (осталось ~{el / i * (len(todo) - i) / 60:.0f} мин)")
++
++
++# ------------------------------------------------------------------ планы
++def pilot_specs(cfg, seed: int = 0) -> list[RunSpec]:
++    """8 оптимизаторов, один seed, LR из середины сетки (4-я из 7 точек)."""
++    bs = cfg.protocol["train"]["batch_size"]
++    return [RunSpec("pilot", o, lr_grid(cfg.grid, o)[3], seed, bs) for o in OPTIMIZERS]
++
++
++def tune_specs(cfg) -> list[RunSpec]:
++    t = cfg.protocol["train"]
++    return [RunSpec("tune", o, lr, s, t["batch_size"]) for o in OPTIMIZERS for lr in lr_grid(cfg.grid, o) for s in t["tuning_seeds"]]
++
++
++def select_lr(cfg) -> dict:
++    """Лучший LR на оптимизатор по среднему val Macro-F1 на tuning-seed; NaN считается за 0; при равенстве берём меньший LR."""
++    runs = read_runs(cfg)
++    runs = runs[runs["phase"] == "tune"].copy()
++    runs["val_f1_final"] = pd.to_numeric(runs["val_f1_final"], errors="coerce").fillna(0.0)
++    chosen, table = {}, []
++    for o, g in runs.groupby("optimizer"):
++        m = g.groupby("lr")["val_f1_final"].mean().sort_index()
++        best = m.max()
++        chosen[o] = float(m[m >= best - 1e-9].index.min())
++        table += [{"optimizer": o, "lr": lr, "val_f1_mean": v, "selected": lr == chosen[o]} for lr, v in m.items()]
++    d = cfg.results_dir / "tuning"
++    d.mkdir(parents=True, exist_ok=True)
++    (d / "selected_lr.json").write_text(json.dumps(chosen, indent=1), encoding="utf-8")
++    pd.DataFrame(table).to_csv(d / "tuning_table.csv", index=False, encoding="utf-8-sig")
++    return chosen
++
++
++def load_selected_lr(cfg) -> dict:
++    p = cfg.results_dir / "tuning" / "selected_lr.json"
++    if not p.exists():
++        raise SystemExit("Нет results/tuning/selected_lr.json: сначала `lab4 tune` и `lab4 select-lr`.")
++    return json.loads(p.read_text(encoding="utf-8"))
++
++
++def main_specs(cfg) -> list[RunSpec]:
++    t, lrs = cfg.protocol["train"], load_selected_lr(cfg)
++    return [RunSpec("main", o, lrs[o], s, t["batch_size"]) for o in OPTIMIZERS for s in t["eval_seeds"]]
++
++
++def sens_specs(cfg, optimizers: list[str]) -> list[RunSpec]:
++    """Один фактор за раз: LR x{0.1, 1/3, 1, 3, 10}, batch size, weight decay; 5 seed."""
++    t, g, lrs = cfg.protocol["train"], cfg.grid["sensitivity"], load_selected_lr(cfg)
++    specs: dict[str, RunSpec] = {}
++    for o in optimizers:
++        for s in t["sens_seeds"]:
++            for m in g["lr_multipliers"]:
++                sp = RunSpec("sens", o, lrs[o] * m, s, t["batch_size"])
++                specs[sp.run_id] = sp
++            for bs in g["batch_sizes"]:
++                sp = RunSpec("sens", o, lrs[o], s, bs)
++                specs[sp.run_id] = sp
++            for wd in g["weight_decays"]:
++                sp = RunSpec("sens", o, lrs[o], s, t["batch_size"], weight_decay=wd)
++                specs[sp.run_id] = sp
++    return list(specs.values())
++
++
++def top_for_sensitivity(cfg) -> list[str]:
++    from . import stats as S
++    runs = read_runs(cfg)
++    main = runs[runs["phase"] == "main"]
++    if main.empty:
++        raise SystemExit("Нет запусков main: sensitivity строится после основного прогона.")
++    sel = cfg.protocol["selection"]
++    summary = S.summarize(main, sel, cfg.protocol["train"]["steps"])
++    score = S.composite(summary, sel["weights"]).sort_values(ascending=False)
++    top = list(score.index[: cfg.grid["sensitivity"]["optimizers_top"]])
++    return top + ([] if "sgd" in top else ["sgd"])
+diff --git a/src/vkr/lab4/spec.py b/src/vkr/lab4/spec.py
+new file mode 100644
+index 0000000..84b07a2
+--- /dev/null
++++ b/src/vkr/lab4/spec.py
+@@ -0,0 +1,20 @@
++"""Описание одного запуска (без torch, чтобы планы запусков строились и без него)."""
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++
++@dataclass(frozen=True)
++class RunSpec:
++    phase: str                  # pilot | tune | main | sens
++    optimizer: str
++    lr: float
++    seed: int
++    batch_size: int = 64
++    weight_decay: float | None = None   # None: значение из grid.yaml
++    steps: int = 0
++
++    @property
++    def run_id(self) -> str:
++        wd = "def" if self.weight_decay is None else f"{self.weight_decay:g}"
++        return f"{self.phase}-{self.optimizer}-lr{self.lr:.4g}-bs{self.batch_size}-wd{wd}-s{self.seed}"
+diff --git a/src/vkr/lab4/stats.py b/src/vkr/lab4/stats.py
+new file mode 100644
+index 0000000..eadaa62
+--- /dev/null
++++ b/src/vkr/lab4/stats.py
+@@ -0,0 +1,157 @@
++"""Статистика, сводный балл, Pareto и проверка гипотез (ТЗ, п. 3.6). Без torch: работает по runs.csv."""
++from __future__ import annotations
++
++import numpy as np
++import pandas as pd
++from scipy import stats as sst
++
++DIRECTION = {"f1": +1, "std": -1, "ece": -1, "steps_to_target": -1, "memory": -1}
++
++
++def bootstrap_ci(x, n: int = 10000, seed: int = 0, alpha: float = 0.05):
++    """Среднее и перцентильный bootstrap-ДИ по seed."""
++    x = np.asarray(x, dtype=float)
++    x = x[~np.isnan(x)]
++    if len(x) == 0:
++        return float("nan"), float("nan"), float("nan")
++    rng = np.random.default_rng(seed)
++    means = x[rng.integers(0, len(x), size=(n, len(x)))].mean(1)
++    return float(x.mean()), float(np.quantile(means, alpha / 2)), float(np.quantile(means, 1 - alpha / 2))
++
++
++def holm(pvals: dict) -> dict:
++    """Поправка Холма-Бонферрони."""
++    items = sorted(pvals.items(), key=lambda kv: kv[1])
++    m, out, run_max = len(items), {}, 0.0
++    for i, (k, p) in enumerate(items):
++        run_max = max(run_max, min(1.0, (m - i) * p))
++        out[k] = run_max
++    return out
++
++
++def _censored_steps(df: pd.DataFrame, budget: int) -> pd.Series:
++    s = pd.to_numeric(df["steps_to_target"], errors="coerce")
++    return s.fillna(budget)
++
++
++def summarize(main: pd.DataFrame, sel: dict, budget_steps: int, metric: str = "test_f1_main", ece_col: str = "test_ece_main") -> pd.DataFrame:
++    rows = []
++    for opt, g in main.groupby("optimizer"):
++        f1 = pd.to_numeric(g[metric], errors="coerce")
++        m, lo, hi = bootstrap_ci(f1.dropna(), sel["bootstrap_resamples"])
++        rows.append({
++            "optimizer": opt, "n_runs": len(g), "f1_mean": m, "f1_std": float(f1.std(ddof=1)) if f1.notna().sum() > 1 else float("nan"),
++            "f1_ci_lo": lo, "f1_ci_hi": hi,
++            "val_f1_mean": pd.to_numeric(g["val_f1_final"], errors="coerce").mean(),
++            "ece_mean": pd.to_numeric(g[ece_col], errors="coerce").mean(),
++            "steps_to_target_mean": _censored_steps(g, budget_steps).mean(),
++            "reached_target": int(pd.to_numeric(g["steps_to_target"], errors="coerce").notna().sum()),
++            "train_time_min": pd.to_numeric(g["train_time_s"], errors="coerce").mean() / 60,
++            "peak_mem_mb": pd.to_numeric(g["peak_mem_mb"], errors="coerce").mean(),
++            "unstable_share": pd.to_numeric(g["unstable"], errors="coerce").mean(),
++        })
++    return pd.DataFrame(rows).set_index("optimizer").sort_index()
++
++
++def _minmax(x: pd.Series, direction: int) -> pd.Series:
++    lo, hi = x.min(), x.max()
++    if not np.isfinite(lo) or hi - lo < 1e-12:
++        return pd.Series(1.0, index=x.index)      # метрики равны у всех: никого не штрафуем
++    z = (x - lo) / (hi - lo)
++    return z if direction > 0 else 1 - z
++
++
++def composite(summary: pd.DataFrame, weights: dict) -> pd.Series:
++    """40 % F1, 20 % разброс, 15 % ECE, 15 % шаги до цели, 10 % память; нормировка min-max между оптимизаторами."""
++    cols = {"f1": "f1_mean", "std": "f1_std", "ece": "ece_mean", "steps_to_target": "steps_to_target_mean", "memory": "peak_mem_mb"}
++    score = sum(weights[k] * _minmax(summary[c].fillna(summary[c].max()), DIRECTION[k]) for k, c in cols.items())
++    return score.rename("score")
++
++
++def pareto_nondominated(summary: pd.DataFrame) -> pd.Series:
++    """Недоминируемость по F1 (больше), времени (меньше) и разбросу (меньше)."""
++    pts = pd.DataFrame({"f1": -summary["f1_mean"], "t": summary["train_time_min"], "sd": summary["f1_std"].fillna(0)})
++    ok = {}
++    for a in pts.index:
++        dom = ((pts <= pts.loc[a]).all(axis=1) & (pts < pts.loc[a]).any(axis=1)).drop(a).any()
++        ok[a] = not dom
++    return pd.Series(ok, name="pareto_ok")
++
++
++def pairwise_wilcoxon(main: pd.DataFrame, winner: str, metric: str = "test_f1_main") -> pd.DataFrame:
++    """Парный Wilcoxon по seed: победитель против каждого, поправка Холма."""
++    piv = main.pivot_table(index="seed", columns="optimizer", values=metric, aggfunc="mean")
++    raw = {}
++    for o in piv.columns:
++        if o == winner:
++            continue
++        d = (piv[winner] - piv[o]).dropna()
++        raw[o] = 1.0 if len(d) == 0 or np.allclose(d, 0) else float(sst.wilcoxon(d, zero_method="wilcox", method="auto").pvalue)
++    adj = holm(raw)
++    return pd.DataFrame({"p_raw": raw, "p_holm": adj, "mean_diff": {o: float((piv[winner] - piv[o]).mean()) for o in raw}})
++
++
++def choose_winner(summary: pd.DataFrame, score: pd.Series, max_unstable: float) -> dict:
++    res = summary.join(score).join(pareto_nondominated(summary))
++    elig = res[res["unstable_share"] <= max_unstable + 1e-12]
++    if elig.empty:
++        return {"winner": None, "verdict": "ни один оптимизатор не прошёл фильтр нестабильности", "table": res}
++    ranked = elig.sort_values("score", ascending=False)
++    nd = ranked[ranked["pareto_ok"]]
++    winner = (nd.index[0] if len(nd) else ranked.index[0])
++    note = "" if ranked.index[0] == winner else f" ({ranked.index[0]} лидирует по баллу, но доминируется по Pareto)"
++    second = ranked.index[1] if len(ranked) > 1 and ranked.index[1] != winner else (ranked.index[2] if len(ranked) > 2 else None)
++    verdict, final = "победитель по сводному баллу" + note, winner
++    if second is not None:
++        a, b = res.loc[winner], res.loc[second]
++        if a["f1_ci_lo"] <= b["f1_ci_hi"] and b["f1_ci_lo"] <= a["f1_ci_hi"]:
++            verdict = f"{winner} и {second} статистически неразличимы (ДИ пересекаются): выбор по стабильности и ресурсам" + note
++            final = min([winner, second], key=lambda o: (res.loc[o, "unstable_share"], res.loc[o, "peak_mem_mb"], res.loc[o, "train_time_min"]))
++    return {"winner": winner, "second": second, "final": final, "verdict": verdict, "table": res}
++
++
++def scenario_table(main: pd.DataFrame, scenarios: list[str]) -> pd.DataFrame:
++    """Средний test Macro-F1 по сценариям, ранг, падение относительно S0."""
++    cols = {s: f"test_f1_{s}" for s in scenarios if f"test_f1_{s}" in main.columns}
++    mean = pd.DataFrame({s: main.groupby("optimizer")[c].apply(lambda x: pd.to_numeric(x, errors="coerce").mean()) for s, c in cols.items()})
++    out = mean.copy()
++    out.columns = [f"F1_{c}" for c in mean.columns]
++    for s in mean.columns:
++        out[f"rank_{s}"] = mean[s].rank(ascending=False, method="min")
++        if "S0" in mean.columns and s != "S0":
++            out[f"drop_{s}"] = mean["S0"] - mean[s]
++    return out
++
++
++def hypotheses(summary: pd.DataFrame, scen: pd.DataFrame, winner: str | None, hyp: dict, main: pd.DataFrame) -> list[dict]:
++    out = []
++    # H1: Adam и AdamW достигают цели минимум на 30 % быстрее SGD по шагам
++    if "sgd" in summary.index:
++        base = summary.loc["sgd", "steps_to_target_mean"]
++        for o in ("adam", "adamw"):
++            if o in summary.index:
++                gain = 1 - summary.loc[o, "steps_to_target_mean"] / base
++                out.append({"h": f"H1 ({o} vs sgd)", "value": f"выигрыш по шагам {gain:.1%}", "ok": bool(gain >= hyp["H1_min_speedup"])})
++    # H2: разрыв F1 лучший-худший >= 0.02 и ДИ лучшего и SGD не пересекаются
++    best, worst = summary["f1_mean"].idxmax(), summary["f1_mean"].idxmin()
++    gap = summary.loc[best, "f1_mean"] - summary.loc[worst, "f1_mean"]
++    ci_ok = None
++    if "sgd" in summary.index and best != "sgd":
++        ci_ok = bool(summary.loc[best, "f1_ci_lo"] > summary.loc["sgd", "f1_ci_hi"])
++    out.append({"h": "H2", "value": f"разрыв {gap:.4f} ({best} - {worst}); ДИ лучшего и SGD не пересекаются: {ci_ok}",
++                "ok": bool(gap >= hyp["H2_min_gap"] and (ci_ok is None or ci_ok))})
++    # H3: победитель в топ-3 на S3-S5
++    if winner is not None:
++        ranks = {s: int(scen.loc[winner, f"rank_{s}"]) for s in ("S3", "S4", "S5") if f"rank_{s}" in scen.columns}
++        out.append({"h": "H3", "value": f"ранги {winner}: {ranks}", "ok": bool(ranks) and all(r <= 3 for r in ranks.values())})
++    out.append({"h": "H4", "value": "проверяется на этапе 8 (каскад с LLM), см. TODO.md", "ok": None})
++    return out
++
++
++def fmt_table(df: pd.DataFrame, floatfmt: str = "{:.4f}") -> str:
++    d = df.reset_index()
++    head = "| " + " | ".join(map(str, d.columns)) + " |"
++    sep = "| " + " | ".join("---" for _ in d.columns) + " |"
++    rows = ["| " + " | ".join(floatfmt.format(v) if isinstance(v, (float, np.floating)) and np.isfinite(v) else str(v) for v in r) + " |"
++            for r in d.itertuples(index=False)]
++    return "\n".join([head, sep] + rows)
+diff --git a/src/vkr/lab4/train.py b/src/vkr/lab4/train.py
+new file mode 100644
+index 0000000..457badd
+--- /dev/null
++++ b/src/vkr/lab4/train.py
+@@ -0,0 +1,205 @@
++"""Один запуск обучения: общий цикл для всех оптимизаторов (ТЗ, п. 3.3-3.5)."""
++from __future__ import annotations
++
++import json
++import math
++import time
++from dataclasses import asdict
++from pathlib import Path
++
++import numpy as np
++import pandas as pd
++import torch
++from torch import nn
++
++from .labels import LABEL2ID, N_CLASSES
++from .metrics import ece, macro_f1
++from .models import n_trainable
++from .mutations import build_set, markov_frames
++from .optimizers import make_optimizer
++from .spec import RunSpec
++
++
++class Context:
++    """Всё, что одинаково для всех запусков: данные, фиксированные val/test-мутации, бэкенд, устройство."""
++
++    def __init__(self, cfg, splits: dict, backend, device: str):
++        self.cfg, self.splits, self.backend, self.device = cfg, splits, backend, device
++        t, mc, sc = cfg.protocol["train"], cfg.mutations, cfg.scenarios
++        self.val = build_set(splits["val"], sc["val_mutations"], "val", mc, mc["seeds"]["val"], t["copies_val"], keep_original=True)
++        self.test_sets: dict[str, pd.DataFrame] = {}
++        for name, s in sc["scenarios"].items():
++            if "mutations" in s:
++                copies = 1 if name == "S0" else t["copies_test"]
++                self.test_sets[name] = build_set(splits["test"], s["mutations"], "test", mc, mc["seeds"]["test"], copies,
++                                                 keep_original=(name == "S0"))
++        self.markov = list(markov_frames(splits["test"], sc["scenarios"]["S5"], mc, mc["seeds"]["test"])) \
++            if "S5" in sc["scenarios"] else []
++
++    def train_set(self, seed: int) -> pd.DataFrame:
++        t, mc = self.cfg.protocol["train"], self.cfg.mutations
++        return build_set(self.splits["train"], self.cfg.scenarios["train_mutations"], "train", mc,
++                         mc["seeds"]["train_base"] + seed, t["copies_train"], keep_original=True)
++
++
++def _labels(df: pd.DataFrame) -> np.ndarray:
++    return df["label"].map(LABEL2ID).to_numpy()
++
++
++@torch.no_grad()
++def predict_probs(model, backend, df: pd.DataFrame, device, cache: dict | None = None, bs: int = 256) -> np.ndarray:
++    """Вероятности классов; одинаковые (заголовок, значения) считаются один раз."""
++    model.eval()
++    keys = list(zip(df["header_text"], df["values_sample"]))
++    cache = {} if cache is None else cache
++    todo = [k for k in dict.fromkeys(keys) if k not in cache]
++    for i in range(0, len(todo), bs):
++        chunk = todo[i:i + bs]
++        batch = backend.collate([backend.encode_one(h, v) for h, v in chunk], device)
++        p = torch.softmax(model(**batch).float(), dim=1).cpu().numpy()
++        for k, row in zip(chunk, p):
++            cache[k] = row
++    return np.stack([cache[k] for k in keys])
++
++
++def _peak_mem_mb(device: str, rss_peak: float) -> float:
++    if device.startswith("cuda"):
++        return torch.cuda.max_memory_allocated() / 2**20
++    return rss_peak
++
++
++def _rss_mb() -> float:
++    import psutil
++    return psutil.Process().memory_info().rss / 2**20
++
++
++def _sync(device: str):
++    if device.startswith("cuda"):
++        torch.cuda.synchronize()
++
++
++def train_run(spec: RunSpec, ctx: Context, log_dir: Path | None = None, eval_scenarios: bool = True,
++              save_probs_dir: Path | None = None) -> dict:
++    cfg, backend, device = ctx.cfg, ctx.backend, ctx.device
++    tcfg = cfg.protocol["train"]
++    steps = spec.steps or tcfg["steps"]
++    target = tcfg["target_val_f1"]
++    if device.startswith("cuda"):
++        torch.cuda.empty_cache()
++        torch.cuda.reset_peak_memory_stats()
++    rng = np.random.default_rng(spec.seed)
++    torch.manual_seed(spec.seed)
++
++    tr = ctx.train_set(spec.seed)
++    y_all = torch.tensor(_labels(tr), dtype=torch.long)
++    items = [backend.encode_one(h, v) for h, v in zip(tr["header_text"], tr["values_sample"])]
++    val_y = _labels(ctx.val)
++
++    model = backend.build_model(spec.seed).to(device)
++    params = [p for p in model.parameters() if p.requires_grad]
++    opt = make_optimizer(spec.optimizer, params, spec.lr, cfg.grid, spec.weight_decay)
++    warm = max(1, int(round(tcfg["warmup_frac"] * steps)))
++    sched = torch.optim.lr_scheduler.LambdaLR(
++        opt, lambda s: (s + 1) / warm if s < warm else 0.5 * (1 + math.cos(math.pi * (s - warm) / max(1, steps - warm))))
++    micro = backend.micro_batch or spec.batch_size
++    loss_fn = nn.CrossEntropyLoss(reduction="sum")
++
++    log, val_curve = [], []
++    steps_to_target, reason = None, ""
++    win_losses, win_means, running_min = [], [], math.inf
++    rss_peak = _rss_mb()
++    perm, ptr = rng.permutation(len(items)), 0
++    eval_time, t_start = 0.0, time.perf_counter()
++    done_steps = 0
++
++    for step in range(steps):
++        if ptr + spec.batch_size > len(perm):
++            perm, ptr = rng.permutation(len(items)), 0
++        idx = perm[ptr:ptr + spec.batch_size]
++        ptr += spec.batch_size
++        model.train()
++        opt.zero_grad(set_to_none=True)
++        total = 0.0
++        for j in range(0, len(idx), micro):
++            sub = idx[j:j + micro]
++            batch = backend.collate([items[i] for i in sub], device)
++            logits = model(**batch)
++            loss = loss_fn(logits.float(), y_all[sub].to(device)) / len(idx)
++            loss.backward()
++            total += loss.item()
++        gnorm = float(torch.nn.utils.clip_grad_norm_(params, tcfg["grad_clip"]))
++        if not math.isfinite(total) or not math.isfinite(gnorm):
++            reason = "nan_inf"
++            done_steps = step
++            break
++        opt.step()
++        sched.step()
++        done_steps = step + 1
++        win_losses.append(total)
++        if done_steps % tcfg["log_every"] == 0:
++            w = float(np.mean(win_losses))
++            win_losses = []
++            win_means.append(w)
++            running_min = min(running_min, w)
++            log.append({"step": done_steps, "train_loss": w, "grad_norm": gnorm})
++            rss_peak = max(rss_peak, _rss_mb())
++            if len(win_means) > 2 and w > 3 * running_min and not reason:
++                reason = "loss_growth_3x"
++        if done_steps % tcfg["eval_every"] == 0:
++            _sync(device)
++            t0 = time.perf_counter()
++            f1 = macro_f1(val_y, predict_probs(model, backend, ctx.val, device).argmax(1))
++            _sync(device)
++            eval_time += time.perf_counter() - t0
++            val_curve.append((done_steps, f1))
++            log.append({"step": done_steps, "val_f1": f1})
++            if steps_to_target is None and f1 >= target:
++                steps_to_target = done_steps
++        if (time.perf_counter() - t_start - eval_time) / 60 > tcfg["time_limit_min"]:
++            reason = reason or "time_limit"
++            break
++    _sync(device)
++    train_time = time.perf_counter() - t_start - eval_time
++
++    row = {**asdict(spec), "steps": steps, "run_id": spec.run_id, "backend": backend.name, "steps_done": done_steps,
++           "n_trainable": n_trainable(model), "train_time_s": round(train_time, 2),
++           "final_loss": win_means[-1] if win_means else float("nan")}
++    if reason == "nan_inf":
++        row.update(val_f1_final=float("nan"), val_f1_best=float("nan"))
++    else:
++        cache: dict = {}
++        vf = macro_f1(val_y, predict_probs(model, backend, ctx.val, device, cache).argmax(1))
++        val_curve.append((done_steps, vf))
++        row.update(val_f1_final=vf, val_f1_best=max(f for _, f in val_curve))
++        if steps_to_target is None:
++            reason = reason or "target_not_reached"
++    row["steps_to_target"] = steps_to_target if steps_to_target is not None else ""
++    row["unstable"] = int(bool(reason))
++    row["unstable_reason"] = reason
++
++    if eval_scenarios and reason != "nan_inf":
++        cache = {}
++        probs_out = {}
++        for name, df in ctx.test_sets.items():
++            P = predict_probs(model, backend, df, device, cache)
++            y = _labels(df)
++            row[f"test_f1_{name}"] = macro_f1(y, P.argmax(1))
++            row[f"test_ece_{name}"] = ece(P, y, cfg.protocol["selection"]["ece_bins"])
++            if name in ("S0", "S3", "S4", "MAIN"):
++                probs_out[name] = P.astype(np.float32)
++        if ctx.markov:
++            f1s = []
++            for frame, _chain in ctx.markov:
++                f1s.append(macro_f1(_labels(frame), predict_probs(model, backend, frame, device, cache).argmax(1)))
++            row["test_f1_S5"] = float(np.mean(f1s))
++            row["test_f1_S5_sd"] = float(np.std(f1s))
++        main = cfg.scenarios["main_scenario"]
++        row["test_f1_main"], row["test_ece_main"] = row.get(f"test_f1_{main}"), row.get(f"test_ece_{main}")
++        if save_probs_dir is not None:
++            save_probs_dir.mkdir(parents=True, exist_ok=True)
++            np.savez_compressed(save_probs_dir / f"{spec.run_id}.npz", **probs_out)
++    row["peak_mem_mb"] = round(_peak_mem_mb(device, max(rss_peak, _rss_mb())), 1)
++    if log_dir is not None:
++        log_dir.mkdir(parents=True, exist_ok=True)
++        (log_dir / f"{spec.run_id}.jsonl").write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in log), encoding="utf-8")
++    return row
+diff --git a/tests/conftest.py b/tests/conftest.py
+new file mode 100644
+index 0000000..153a1fb
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,26 @@
++import sys
++from pathlib import Path
++
++import pytest
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
++
++from vkr.lab4.config import Config  # noqa: E402
++from vkr.lab4.data import load_observations, split_frames  # noqa: E402
++from vkr.lab4.demo_data import make_demo  # noqa: E402
++
++
++@pytest.fixture(scope="session")
++def cfg():
++    return Config()
++
++
++@pytest.fixture(scope="session")
++def demo_df(tmp_path_factory):
++    d = make_demo(tmp_path_factory.mktemp("demo") / "out")
++    return load_observations(d)
++
++
++@pytest.fixture(scope="session")
++def splits(demo_df):
++    return split_frames(demo_df)
+diff --git a/tests/test_config_and_plans.py b/tests/test_config_and_plans.py
+new file mode 100644
+index 0000000..b8b8528
+--- /dev/null
++++ b/tests/test_config_and_plans.py
+@@ -0,0 +1,77 @@
++import shutil
++
++import pytest
++
++from vkr.lab4 import config as C
++from vkr.lab4.features import ngram_ids, normalize, value_features
++from vkr.lab4.metrics import ece, macro_f1
++from vkr.lab4.optimizers import OPTIMIZERS, lr_grid
++from vkr.lab4.runner import FIELDS, pilot_specs, tune_specs
++from vkr.lab4.spec import RunSpec
++
++import numpy as np
++
++
++def test_lock_detects_changes(tmp_path):
++    d = tmp_path / "configs"
++    shutil.copytree(C.CONFIG_DIR, d)
++    lock = tmp_path / "lock.json"
++    C.write_lock(d, lock)
++    C.check_lock(d, lock)
++    (d / "grid.yaml").write_text((d / "grid.yaml").read_text(encoding="utf-8").replace("n: 7", "n: 8", 1), encoding="utf-8")
++    with pytest.raises(RuntimeError):
++        C.check_lock(d, lock)
++
++
++def test_lock_ignores_frozen_flag(tmp_path):
++    d = tmp_path / "configs"
++    shutil.copytree(C.CONFIG_DIR, d)
++    lock = tmp_path / "lock.json"
++    C.write_lock(d, lock)
++    p = d / "protocol.yaml"
++    p.write_text(p.read_text(encoding="utf-8").replace("frozen: false", "frozen: true"), encoding="utf-8")
++    C.check_lock(d, lock)
++
++
++def test_missing_lock_blocks(tmp_path):
++    with pytest.raises(RuntimeError):
++        C.check_lock(lock_path=tmp_path / "none.json")
++
++
++def test_plan_sizes(cfg):
++    assert len(OPTIMIZERS) == 8
++    assert len(tune_specs(cfg)) == 8 * 7 * 2 == 112
++    assert len(pilot_specs(cfg)) == 8
++    assert len({s.run_id for s in tune_specs(cfg)}) == 112
++
++
++def test_lr_grids(cfg):
++    a, s = lr_grid(cfg.grid, "adam"), lr_grid(cfg.grid, "sgd")
++    assert len(a) == len(s) == 7 and abs(a[0] - 1e-4) < 1e-12 and abs(a[-1] - 0.1) < 1e-9
++    assert abs(s[0] - 1e-3) < 1e-12 and abs(s[-1] - 1.0) < 1e-9
++    assert lr_grid(cfg.grid, "adamw") == a and lr_grid(cfg.grid, "nesterov") == s
++
++
++def test_weight_decay_only_adamw(cfg):
++    wd = {o: cfg.grid["optimizers"][o]["weight_decay"] for o in OPTIMIZERS}
++    assert wd["adamw"] == 0.01 and all(v == 0 for o, v in wd.items() if o != "adamw")
++
++
++def test_run_id_unique_per_setting():
++    a = RunSpec("main", "adam", 1e-3, 0)
++    assert a.run_id != RunSpec("main", "adam", 1e-3, 1).run_id != RunSpec("sens", "adam", 1e-3, 1, weight_decay=0.0).run_id
++
++
++def test_features_stable_and_normalised():
++    assert ngram_ids("Количество", 1000) == ngram_ids("  КОЛИЧЕСТВО ", 1000)
++    assert ngram_ids("Цена", 32768) == ngram_ids("Цена", 32768)
++    f = value_features("12.50 | 3")
++    assert len(f) == 3 and f[2] == 1.0 and 0 <= f[0] <= 1
++
++
++def test_metrics():
++    assert macro_f1([0, 1, 1], [0, 1, 1]) == 1.0
++    assert macro_f1([0, 1], [1, 0]) == 0.0
++    p = np.array([[0.9, 0.1], [0.9, 0.1]])
++    assert abs(ece(p, [0, 0]) - 0.1) < 1e-9
++    assert len(FIELDS) == len(set(FIELDS))
+diff --git a/tests/test_data.py b/tests/test_data.py
+new file mode 100644
+index 0000000..338d7e2
+--- /dev/null
++++ b/tests/test_data.py
+@@ -0,0 +1,34 @@
++from vkr.lab4.data import leak_report, passport, split_json
++from vkr.lab4.labels import LABELS
++
++
++def test_demo_shape_matches_lab1_structure(demo_df):
++    assert demo_df["doc_ref"].nunique() == 116
++    assert demo_df["cluster_id"].nunique() == 7
++    assert demo_df["header_text"].nunique() == 17
++    docs = demo_df.drop_duplicates("doc_ref")["split"].value_counts().to_dict()
++    assert docs == {"train": 80, "val": 18, "test": 18}
++
++
++def test_labels_are_known(demo_df):
++    assert set(demo_df["label"]) <= set(LABELS)
++
++
++def test_no_leaks_in_demo(demo_df):
++    rep = leak_report(demo_df)
++    assert rep["clean"], rep
++
++
++def test_leak_detected_when_cluster_split(demo_df):
++    bad = demo_df.copy()
++    first_doc = bad[bad["cluster_id"] == "0"]["doc_ref"].iloc[0]
++    bad.loc[bad["doc_ref"] == first_doc, "split"] = "test"
++    assert not leak_report(bad)["clean"]
++
++
++def test_passport_and_split_json(demo_df):
++    rep = leak_report(demo_df)
++    text = passport(demo_df, rep)
++    assert "Паспорт данных" in text and "unmapped" in text
++    sj = split_json(demo_df, rep)
++    assert sj["parts"]["train"]["documents"] == 80
+diff --git a/tests/test_mutations.py b/tests/test_mutations.py
+new file mode 100644
+index 0000000..fe06799
+--- /dev/null
++++ b/tests/test_mutations.py
+@@ -0,0 +1,81 @@
++import numpy as np
++import pytest
++
++from vkr.lab4.mutations import (HoldoutViolation, build_set, m1_typos, m5_two_level, markov_chain, markov_frames,
++                                mutate_frame, synonym_pool)
++
++
++def tags(df):
++    return set("+".join(df["mut"]).replace("+extra", "").split("+")) - {""}
++
++
++def test_holdout_families_never_reach_train_or_val(cfg, splits):
++    mc = cfg.mutations
++    for fam, split in [("M3", "train"), ("M5", "train"), ("M6", "train"), ("M5", "val"), ("M6", "val")]:
++        with pytest.raises(HoldoutViolation):
++            mutate_frame(splits[split], {fam: {"p": 1.0, "p_doc": 1.0}}, split, mc, np.random.default_rng(0))
++
++
++def test_train_and_val_sets_have_only_visible_families(cfg, splits):
++    mc, sc = cfg.mutations, cfg.scenarios
++    tr = build_set(splits["train"], sc["train_mutations"], "train", mc, 1000, 4, True)
++    va = build_set(splits["val"], sc["val_mutations"], "val", mc, 2000, 2, True)
++    assert tags(tr) <= {"M1", "M2", "M4"}
++    assert tags(va) <= {"M1", "M2", "M3", "M4"}
++    assert (tr["copy"] == 0).sum() == len(splits["train"]) and (tr.loc[tr["copy"] == 0, "mut"] == "").all()
++
++
++def test_test_synonyms_are_not_in_train_pool_and_val_is_subset(cfg):
++    mc = cfg.mutations
++    assert all(not v for v in synonym_pool(mc, "train").values())
++    val, test = synonym_pool(mc, "val"), synonym_pool(mc, "test")
++    assert all(set(val[k]) < set(test[k]) for k in val)
++
++
++def test_all_scenarios_run_and_keep_labels(cfg, splits):
++    t = splits["test"]
++    for name, s in cfg.scenarios["scenarios"].items():
++        if "mutations" not in s:
++            continue
++        m = build_set(t, s["mutations"], "test", cfg.mutations, 3000, 1, False)
++        assert set(m["label"]) <= set(t["label"]) | {"unmapped"}
++        assert len(m) >= len(t)
++        if name == "S0":
++            assert (m["header_text"].to_numpy() == t["header_text"].to_numpy()).all()
++
++
++def test_mutations_are_deterministic_per_seed(cfg, splits):
++    spec = cfg.scenarios["scenarios"]["MAIN"]["mutations"]
++    a = build_set(splits["test"], spec, "test", cfg.mutations, 3000, 2, False)
++    b = build_set(splits["test"], spec, "test", cfg.mutations, 3000, 2, False)
++    c = build_set(splits["test"], spec, "test", cfg.mutations, 3001, 2, False)
++    assert a.equals(b) and not a["header_text"].equals(c["header_text"])
++
++
++def test_m1_typo_rate_changes_with_p():
++    rng = np.random.default_rng(0)
++    base = "количество товаров " * 5
++    ops = ["replace", "delete", "swap"]
++    low = np.mean([m1_typos(base, 0.03, ops, rng) != base for _ in range(200)])
++    assert low > 0.5
++    assert m1_typos(base, 0.0, ops, rng) == base
++
++
++def test_m5_two_level():
++    rng = np.random.default_rng(1)
++    outs = {m5_two_level("стоимость без налога - всего", ["glue", "break"], rng) for _ in range(30)}
++    assert outs == {"стоимость без / налога - всего", "налога - всего"}      # склейка и потеря верхнего уровня
++    assert m5_two_level("единица измерения / код", ["glue"], rng) == "единица измерения код"
++    assert m5_two_level("акциз", ["glue", "break"], rng) == "акциз"
++
++
++def test_markov_chain_stay_probability():
++    rng = np.random.default_rng(0)
++    ch = markov_chain(20000, 0.8, ["T0", "T1", "T2"], "T0", rng)
++    stay = np.mean([a == b for a, b in zip(ch, ch[1:])])
++    assert abs(stay - 0.8) < 0.02
++
++
++def test_markov_frames_count(cfg, splits):
++    frames = list(markov_frames(splits["test"], cfg.scenarios["scenarios"]["S5"], cfg.mutations, 7))
++    assert len(frames) == 100 and all(len(f) == len(splits["test"]) for f, _ in frames)
+diff --git a/tests/test_stats.py b/tests/test_stats.py
+new file mode 100644
+index 0000000..26cdc13
+--- /dev/null
++++ b/tests/test_stats.py
+@@ -0,0 +1,68 @@
++import numpy as np
++import pandas as pd
++
++from vkr.lab4 import stats as S
++from vkr.lab4.optimizers import OPTIMIZERS
++
++
++def synthetic_runs(seed=0, n_seeds=10):
++    rng = np.random.default_rng(seed)
++    quality = dict(zip(OPTIMIZERS, [0.80, 0.84, 0.845, 0.82, 0.835, 0.90, 0.905, 0.895]))
++    rows = []
++    for o in OPTIMIZERS:
++        for s in range(n_seeds):
++            f1 = quality[o] + rng.normal(0, 0.01)
++            rows.append({"run_id": f"main-{o}-{s}", "phase": "main", "optimizer": o, "seed": s, "val_f1_final": f1,
++                         "test_f1_main": f1, "test_ece_main": 0.05 + rng.normal(0, 0.005),
++                         "steps_to_target": 300 if o in ("adam", "adamw", "radam") else (500 if o != "sgd" else ""),
++                         "train_time_s": 100 + rng.normal(0, 3), "peak_mem_mb": 500 + 10 * OPTIMIZERS.index(o),
++                         "unstable": int(o == "sgd" and s < 3), "test_f1_S0": 0.99, "test_f1_S3": f1 - 0.05,
++                         "test_f1_S4": f1 - 0.03, "test_f1_S5": f1 - 0.02})
++    return pd.DataFrame(rows)
++
++
++SEL = {"bootstrap_resamples": 2000, "weights": {"f1": 0.4, "std": 0.2, "ece": 0.15, "steps_to_target": 0.15, "memory": 0.10},
++       "max_unstable_share": 0.2}
++
++
++def test_bootstrap_ci_contains_mean():
++    m, lo, hi = S.bootstrap_ci([0.8, 0.82, 0.81, 0.79, 0.83], 2000)
++    assert lo <= m <= hi
++
++
++def test_holm_monotone_and_bounded():
++    adj = S.holm({"a": 0.01, "b": 0.04, "c": 0.5})
++    assert adj["a"] == 0.03 and adj["b"] <= adj["c"] <= 1.0
++
++
++def test_composite_and_choice():
++    runs = synthetic_runs()
++    summ = S.summarize(runs, SEL, 600)
++    score = S.composite(summ, SEL["weights"])
++    assert score.between(0, 1).all()
++    res = S.choose_winner(summ, score, 0.2)
++    assert res["winner"] in {"adam", "adamw", "radam"}
++    assert res["table"].loc["sgd", "unstable_share"] == 0.3      # SGD отсеян фильтром
++    assert res["winner"] != "sgd"
++
++
++def test_minmax_ties_do_not_penalise():
++    assert (S._minmax(pd.Series([1.0, 1.0, 1.0]), -1) == 1.0).all()
++
++
++def test_wilcoxon_and_hypotheses():
++    runs = synthetic_runs()
++    summ = S.summarize(runs, SEL, 600)
++    w = S.pairwise_wilcoxon(runs, "adamw")
++    assert "sgd" in w.index and (w["p_holm"] >= w["p_raw"] - 1e-12).all()
++    scen = S.scenario_table(runs, ["S0", "S3", "S4", "S5"])
++    hyp = S.hypotheses(summ, scen, "adamw", {"H1_min_speedup": 0.3, "H2_min_gap": 0.02}, runs)
++    h = {x["h"]: x for x in hyp}
++    assert h["H2"]["ok"] is True
++    assert h["H1 (adam vs sgd)"]["ok"] is True      # sgd не достигает цели: цензурируется бюджетом шагов
++
++
++def test_pareto_flags_dominated():
++    summ = pd.DataFrame({"f1_mean": [0.9, 0.8], "train_time_min": [1.0, 2.0], "f1_std": [0.01, 0.02]}, index=["a", "b"])
++    ok = S.pareto_nondominated(summ)
++    assert ok["a"] and not ok["b"]
+diff --git a/tests/test_torch_smoke.py b/tests/test_torch_smoke.py
+new file mode 100644
+index 0000000..9dc9524
+--- /dev/null
++++ b/tests/test_torch_smoke.py
+@@ -0,0 +1,41 @@
++"""Требует torch (на машине с GPU/CPU после `uv sync`). Проверяет весь цикл обучения на компактной модели и демо-данных."""
++import pytest
++
++torch = pytest.importorskip("torch")
++
++from vkr.lab4.models import make_backend  # noqa: E402
++from vkr.lab4.optimizers import OPTIMIZERS, lr_grid  # noqa: E402
++from vkr.lab4.spec import RunSpec  # noqa: E402
++from vkr.lab4.train import Context, train_run  # noqa: E402
++
++
++@pytest.fixture(scope="module")
++def ctx(cfg, splits):
++    cfg.protocol["train"].update({"steps": 100, "eval_every": 50, "log_every": 25, "copies_train": 2, "copies_val": 1, "copies_test": 1})
++    cfg.protocol["model"]["backend"] = "ngram"
++    return Context(cfg, splits, make_backend(cfg.protocol), "cpu")
++
++
++def test_ngram_model_is_small(ctx):
++    from vkr.lab4.models import n_trainable
++    assert n_trainable(ctx.backend.build_model(0)) < 1_000_000
++
++
++@pytest.mark.parametrize("opt", OPTIMIZERS)
++def test_all_optimizers_train(ctx, opt):
++    row = train_run(RunSpec("pilot", opt, lr_grid(ctx.cfg.grid, opt)[3], 0), ctx, None, eval_scenarios=True)
++    assert row["steps_done"] == 100
++    assert row["val_f1_final"] == row["val_f1_final"]       # не NaN
++    for k in ("test_f1_S0", "test_f1_MAIN", "test_f1_S5", "test_ece_MAIN"):
++        assert 0.0 <= row[k] <= 1.0
++
++
++def test_same_seed_is_reproducible(ctx):
++    a = train_run(RunSpec("pilot", "adam", 1e-3, 3), ctx, None, eval_scenarios=False)
++    b = train_run(RunSpec("pilot", "adam", 1e-3, 3), ctx, None, eval_scenarios=False)
++    assert a["val_f1_final"] == b["val_f1_final"] and a["final_loss"] == b["final_loss"]
++
++
++def test_diverging_run_is_flagged(ctx):
++    row = train_run(RunSpec("pilot", "sgd", 1e6, 0), ctx, None, eval_scenarios=False)
++    assert row["unstable"] == 1

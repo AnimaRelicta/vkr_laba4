@@ -1,0 +1,56 @@
+# Единый источник параметров эксперимента. Человекочитаемая версия: PROTOCOL.md.
+# После `lab4 freeze` файлы configs/*.yaml защищены хешем (protocol.lock.json).
+frozen: false           # ставится командой lab4 freeze
+data:
+  dir: data/lab1/out          # папка результата prepare_dataset.py из ЛР1 (нужен observations.csv)
+  split_column: split         # берём split из ЛР1 как есть
+model:
+  backend: qwen               # qwen | ngram (ngram: компактная модель из ТЗ, быстрый CPU-базис и smoke-тесты)
+  qwen:
+    name: Qwen/Qwen3-0.6B     # ~0.6 млрд параметров, влезает в 8 ГБ RTX 4060 (запасной: Qwen/Qwen2.5-0.5B)
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+    max_len: 64
+    micro_batch: 16           # градиентная аккумуляция: эффективный batch = train.batch_size, память активаций в 4 раза меньше
+    head_dropout: 0.2
+    base_dtype: bfloat16      # база заморожена; LoRA-адаптеры и голова обучаются в FP32
+  ngram:
+    buckets: 32768
+    emb_dim: 24
+    ngram_min: 2
+    ngram_max: 5
+    hidden: 256
+    dropout: 0.2
+train:
+  batch_size: 64
+  steps: 600                  # ПРЕДЛОЖЕНИЕ, уточняется на пилоте и замораживается
+  warmup_frac: 0.05
+  scheduler: cosine
+  grad_clip: 1.0
+  eval_every: 100             # val Macro-F1
+  log_every: 50               # train loss и норма градиента
+  target_val_f1: 0.90         # ПРЕДЛОЖЕНИЕ (ориентир из ТЗ), уточняется на пилоте
+  copies_train: 4             # 1 исходная + 3 мутированные копии каждой колонки (мутации перебрасываются по seed)
+  copies_val: 2
+  copies_test: 3
+  tuning_seeds: [100, 101]
+  eval_seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  sens_seeds: [0, 1, 2, 3, 4]
+  time_limit_min: 15          # лимит одного запуска (общий для всех оптимизаторов)
+selection:
+  max_unstable_share: 0.20
+  weights: {f1: 0.40, std: 0.20, ece: 0.15, steps_to_target: 0.15, memory: 0.10}
+  bootstrap_resamples: 10000
+  ece_bins: 15
+hypotheses:
+  H1_min_speedup: 0.30        # Adam/AdamW быстрее SGD по шагам до цели минимум на 30 %
+  H2_min_gap: 0.02            # разрыв Macro-F1 лучший-худший на test с мутациями
+  H4_min_f1: 0.96
+  H4_max_llm_share: 0.30
+cascade:
+  max_cost_share: 0.50
+  max_f1_drop: 0.01
+paths:
+  results: results
