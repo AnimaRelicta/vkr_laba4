@@ -1,0 +1,9 @@
+{
+ "sha256": "06645e62493c9288cb640e6b63689c5b4a4714bc6b44b847d1e7c92f65465a2c",
+ "files": [
+  "protocol.yaml",
+  "grid.yaml",
+  "mutations.yaml",
+  "scenarios.yaml"
+ ]
+}

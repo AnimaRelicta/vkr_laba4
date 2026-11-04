@@ -36,7 +36,7 @@
 
 - [~] Qwen3-0.6B + LoRA и компактная n-gram модель, 8 оптимизаторов, общий цикл обучения (`train.py`). **Torch-код не запускался в среде разработки (нет GPU и доступа к PyPI/HF); первым делом `uv run pytest` и `uv run lab4 bench`**
 - [~] Бюджет урезан (шаг 2): 80 шагов, tune 56, main 40, sens 54, micro_batch 16 (замер: 0,825 с/шаг, 4,4 ГБ), оценка ≈ 3,8 ч; `lab4 smoke` прошёл; запустить `uv run lab4 smoke`, затем `uv run lab4 bench --micro 8 16 24`, записать с/шаг, micro_batch и часы в PROTOCOL.md раздел 9
-- [ ] `uv run lab4 pilot` -> выбрать число шагов и целевой F1 -> `uv run lab4 freeze --steps N --target F`
+- [x] `uv run lab4 pilot` выполнен (см. PROTOCOL.md): шагов 80, целевой val F1 0,90 -> `uv run lab4 freeze --steps 80 --target 0.90`
 
 ## Этап 4. Настройка LR (1 день)
 
@@ -57,7 +57,7 @@
 
 - [~] Sensitivity по LR, batch size, weight decay для топ-3 + SGD, 5 seed (`lab4 sens`)
 - [ ] rank-диаграмма и ширина «плато» по LR (графики по результатам sens)
-- [ ] Шум градиента на чекпоинте шага 500: 200 мини-батчей, batch 16/32/64/128 (параметры в `grid.yaml: noise`, кода пока нет)
+- [ ] Шум градиента на чекпоинте шага 40: 200 мини-батчей, batch 16/32/64/128 (параметры в `grid.yaml: noise`, кода пока нет)
 - [ ] Bootstrap по документам и leave-one-cluster-out для трёх финалистов
 - [ ] Карта источников случайности для отчёта
 - [x] Сценарии S0-S5 (S5: 100 розыгрышей цепи Маркова) считаются в каждом основном запуске

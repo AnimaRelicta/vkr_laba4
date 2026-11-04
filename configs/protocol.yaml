@@ -1,6 +1,6 @@
 # Единый источник параметров эксперимента. Человекочитаемая версия: PROTOCOL.md.
 # После `lab4 freeze` файлы configs/*.yaml защищены хешем (protocol.lock.json).
-frozen: false           # ставится командой lab4 freeze
+frozen: true           # ставится командой lab4 freeze
 data:
   dir: data/lab1/out          # папка результата prepare_dataset.py из ЛР1 (нужен observations.csv)
   split_column: split         # берём split из ЛР1 как есть
@@ -32,7 +32,7 @@ train:
   grad_clip: 1.0
   eval_every: 10              # val Macro-F1
   log_every: 20               # train loss и норма градиента
-  target_val_f1: 0.90         # ПРЕДЛОЖЕНИЕ (ориентир из ТЗ), уточняется на пилоте
+  target_val_f1: 0.9         # ПРЕДЛОЖЕНИЕ (ориентир из ТЗ), уточняется на пилоте
   copies_train: 4             # 1 исходная + 3 мутированные копии каждой колонки (мутации перебрасываются по seed)
   copies_val: 2
   copies_test: 3
