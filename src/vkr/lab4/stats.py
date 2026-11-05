@@ -144,7 +144,7 @@ def hypotheses(summary: pd.DataFrame, scen: pd.DataFrame, winner: str | None, hy
     if winner is not None:
         ranks = {s: int(scen.loc[winner, f"rank_{s}"]) for s in ("S3", "S4", "S5") if f"rank_{s}" in scen.columns}
         out.append({"h": "H3", "value": f"ранги {winner}: {ranks}", "ok": bool(ranks) and all(r <= 3 for r in ranks.values())})
-    out.append({"h": "H4", "value": "проверяется на этапе 8 (каскад с LLM), см. TODO.md", "ok": None})
+    out.append({"h": "H4", "value": "вне объёма задания ЛР4 (каскад с LLM не выполняется); перенос: `lab4 transfer`", "ok": None})
     return out
 
 

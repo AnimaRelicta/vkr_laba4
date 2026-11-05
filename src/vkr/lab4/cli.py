@@ -172,8 +172,14 @@ def cmd_smoke(args):
     opts = top_for_sensitivity(cfg)
     print("sensitivity для:", opts)
     execute(sens_specs(cfg, opts), ctx, eval_scenarios=True)
+    print("== noise")
+    from .noise import run_noise
+    run_noise(cfg, ctx, ["adam", "sgd"], [0])
     print("== stats")
     print("Отчёт:", build_report(cfg, read_runs(cfg)))
+    print("== stoch")
+    from .stoch_report import build_stoch_report
+    print("Отчёт:", build_stoch_report(cfg, read_runs(cfg), None, 200))
     print(f"SMOKE OK. Результаты проверки лежат в {cfg.results_dir} (в основные results/ не попадают, можно удалить).")
 
 
@@ -217,11 +223,44 @@ def cmd_sens(args):
     execute(sens_specs(cfg, opts), _context(cfg), eval_scenarios=True)
 
 
+def cmd_noise(args):
+    from .noise import run_noise
+    cfg = _cfg(args)
+    check_lock()
+    run_noise(cfg, _context(cfg), args.optimizers, args.seeds, args.n_batches)
+
+
+def cmd_stoch(args):
+    from .runner import read_runs
+    from .stoch_report import build_stoch_report
+    cfg = _cfg(args)
+    print("Отчёт:", build_stoch_report(cfg, read_runs(cfg), args.only, args.bootstrap))
+
+
 def cmd_stats(args):
     from .report import build_report
     from .runner import read_runs
     cfg = _cfg(args)
     print("Отчёт:", build_report(cfg, read_runs(cfg)))
+
+
+def cmd_transfer(args):
+    from .runner import read_runs
+    from .transfer import build_transfer
+    cfg = _cfg(args)
+    lab1 = {"f1": args.lab1_f1, "n": args.lab1_n, "n4": args.lab4_n, "name": args.lab1_name} if args.lab1_f1 else None
+    print("Отчёт:", build_transfer(cfg, read_runs(cfg), args.final, tuple(args.baselines), lab1))
+
+
+def cmd_check_report(args):
+    from .check_report import run_check
+    cfg = _cfg(args)
+    out, res = run_check(cfg, Path(args.file), args.allow)
+    print(f"Отчёт: {out}. Подтверждено: {len(res['ok'])}, без источника: {len(res['bad'])} десятичных, {len(res['ints'])} целых")
+    for i in res["bad"][:20]:
+        print(f"  ? {i['число']}: …{i['контекст']}…")
+    if res["bad"]:
+        sys.exit(1)
 
 
 def cmd_status(args):
@@ -266,8 +305,25 @@ def main(argv=None):
     add("tune", cmd_tune, "этап 4: подбор LR (8 x 7 x 2 запуска)")
     add("select-lr", cmd_select_lr, "выбрать LR по результатам tune")
     add("main", cmd_main, "этап 5: 8 оптимизаторов x 10 seed + сценарии S0-S5")
-    add("sens", cmd_sens, "этап 7: sensitivity (LR, batch size, weight decay)")
+    add("sens", cmd_sens, "этап 7: запуски sensitivity (LR, batch size, weight decay)")
+    p = add("noise", cmd_noise, "этап 7: шум градиента на чекпоинте (нужен torch и GPU)")
+    p.add_argument("--optimizers", nargs="*", help="по умолчанию: финалисты (топ-3 по баллу) + sgd")
+    p.add_argument("--seeds", type=int, nargs="*", default=[0])
+    p.add_argument("--n-batches", type=int, default=0, help="только для проверки: переопределить grid.yaml (отступление нужно отметить в отчёте)")
+    p = add("stoch", cmd_stoch, "этап 7: sensitivity-таблицы, плато, bootstrap по документам, LOCO, шум, карта случайности (без torch)")
+    p.add_argument("--only", nargs="*", choices=["sens", "noise", "robust", "map"], help="только эти разделы")
+    p.add_argument("--bootstrap", type=int, default=2000, help="число перевыборок")
     add("stats", cmd_stats, "этап 6: статистика, сводный балл, гипотезы, графики")
+    p = add("transfer", cmd_transfer, "задание 4: выбранный оптимизатор против SGD/Adam и сопоставление с ЛР1 (из runs.csv)")
+    p.add_argument("--final", help="по умолчанию итоговый выбор из stats")
+    p.add_argument("--baselines", nargs="*", default=["sgd", "adam"])
+    p.add_argument("--lab1-f1", type=float, help="Macro-F1 LLM из ЛР1, например 0.9640")
+    p.add_argument("--lab1-n", type=int, help="строк в тесте ЛР1 (out_hard/test), например 255")
+    p.add_argument("--lab4-n", type=int, help="строк в исходном тесте ЛР4 (out/test), например 216")
+    p.add_argument("--lab1-name", default="qwen/qwen3.8-flash, few-shot k=3")
+    p = add("check-report", cmd_check_report, "проверка: каждое число отчёта (.md/.txt/.docx) есть в results/<backend>/")
+    p.add_argument("file")
+    p.add_argument("--allow", type=float, nargs="*", default=[], help="внешние числа, которых нет в results (например 0.9640 255 216)")
     add("status", cmd_status, "сколько запусков выполнено")
     args = ap.parse_args(argv)
     args.fn(args)

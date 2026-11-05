@@ -35,5 +35,6 @@ def smoke_config(cfg, steps: int = 8):
     for fam in cfg.grid["lr_grid"].values():
         fam["n"] = 2                     # концы сетки: проверяется и расходящийся запуск (SGD lr=1)
     cfg.grid["sensitivity"].update(optimizers_top=2, lr_multipliers=[1.0, 3.0], batch_sizes=[32, 64], weight_decays=[0.0, 0.01])
+    cfg.grid["noise"].update(checkpoint_step=max(1, steps // 2), n_batches=3, batch_sizes=[4, 8])
     cfg.protocol["paths"]["results"] = "results_smoke"
     return cfg

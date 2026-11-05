@@ -1,0 +1,468 @@
+diff --git a/PROTOCOL.md b/PROTOCOL.md
+index 05d457f..64ee09b 100644
+--- a/PROTOCOL.md
++++ b/PROTOCOL.md
+@@ -7,7 +7,7 @@
+ ## 1. Цель и вопрос
+ 
+ Выбрать лучший из 8 оптимизаторов для классификатора «заголовок колонки -> каноническое поле УПД» и проверить, что
+-выигрыш сохраняется в каскаде с LLM из ЛР1 (qwen/qwen3.8-flash, few-shot k=3, Macro-F1 0,9640, 5,56 ₽ за прогон).
++выигрыш переносится на сопоставление с ЛР1 (qwen/qwen3.8-flash, few-shot k=3, Macro-F1 0,9640, 5,56 ₽ за прогон). Каскад с LLM (H4) из объёма задания исключён, см. раздел 8.
+ 
+ ## 2. Модель и данные
+ 
+@@ -77,11 +77,16 @@ S5: цепь версий T0 (исходная), T1 (все заголовки 
+ | H1 | Adam и AdamW достигают целевого val F1 минимум на 30 % быстрее по числу шагов, чем SGD без momentum | шаги до цели, 10 seed |
+ | H2 | Разница Macro-F1 лучшего и худшего оптимизатора на test с мутациями не меньше 0,02, а 95 % ДИ лучшего и SGD не пересекаются | bootstrap, парный Wilcoxon |
+ | H3 | Лучший по сводному баллу оптимизатор остаётся в топ-3 на S3-S5 | ранги по сценариям |
+-| H4 | Каскад «классификатор + qwen3.8-flash» держит Macro-F1 не ниже 0,96 и вызывает LLM не более чем для 30 % колонок | этап 8 |
++| H4 | Каскад «классификатор + qwen3.8-flash» держит Macro-F1 не ниже 0,96 и вызывает LLM не более чем для 30 % колонок | **вне объёма задания, не проверяется** (пороги остаются в `protocol.yaml`, он заморожен) |
+ 
+ Если H2 не подтвердится - допустимый результат: «различия в пределах шума», выбор по ресурсам и стабильности.
+ 
+-## 8. Каскад (этап 8)
++## 8. Перенос лучшего метода (задание 4); каскад с LLM вне объёма
++
++Перенос закрывается командой `lab4 transfer`: выбранный по разделу 6 оптимизатор против базовых (SGD, Adam) в модели ЛР4 по F1 на S0, S3, S4, MAIN, S5, ECE, шагам до цели, времени и памяти (средние, bootstrap-ДИ и парные разности по seed) и сопоставление с итогом ЛР1 (Macro-F1 0,9640). Числа ЛР1 и ЛР4 напрямую не сравнимы: модели разные (LLM и Qwen3-0.6B + LoRA), тестовые наборы разные (out_hard/test, 255 строк, и out/test, 216 строк), в ЛР4 добавлены мутации.
++
++Описание каскада ниже сохранено как черновик первоначального плана; в объём задания оно не входит, H4 и критерий переноса по каскаду не проверяются.
++
+ 
+ 1. Точное совпадение заголовка с эталоном - ответ без модели. 2. Иначе классификатор: max p >= τ и класс не unmapped. 3. Иначе LLM (few-shot k=3, промпт ЛР1).
+ τ подбирается на val по кривой «доля вызовов LLM - Macro-F1» и не пересматривается после просмотра test. Критерий переноса (предложение): каскад с лучшим
+diff --git a/README.md b/README.md
+index 0bdcf5c..c41831f 100644
+--- a/README.md
++++ b/README.md
+@@ -75,6 +75,12 @@ uv run lab4 noise
+ # -> results/<backend>/stochastic/report.md (без torch; для bootstrap/LOCO нужны данные ЛР1 и results/<backend>/probs/)
+ uv run lab4 stoch
+ 
++# задание 4: перенос лучшего метода (выбранный против SGD и Adam, сопоставление с ЛР1) -> results/<backend>/transfer/
++uv run lab4 transfer --lab1-f1 0.9640 --lab1-n 255 --lab4-n 216
++
++# проверка отчёта: каждое число из .md/.txt/.docx должно быть в results/<backend>/ (числа ЛР1 передаются через --allow)
++uv run lab4 check-report report.docx --allow 0.9640 255 216
++
+ uv run lab4 status                            # сколько запусков выполнено
+ ```
+ 
+@@ -86,7 +92,7 @@ uv run lab4 status                            # сколько запусков
+ | Путь | Что |
+ | --- | --- |
+ | `configs/protocol.yaml, grid.yaml, mutations.yaml, scenarios.yaml` | параметры эксперимента (замораживаются хешем) |
+-| `src/vkr/lab4/` | код: `data`, `mutations`, `features`, `models`, `optimizers`, `train`, `runner`, `stats`, `report`, `stochastic`, `stoch_report`, `noise`, `cli` |
++| `src/vkr/lab4/` | код: `data`, `mutations`, `features`, `models`, `optimizers`, `train`, `runner`, `stats`, `report`, `stochastic`, `stoch_report`, `noise`, `transfer`, `check_report`, `cli` |
+ | `artifacts/` | `data_passport.md`, `split.json` |
+ | `results/<backend>/runs.csv` | одна строка на запуск: seed, параметры, метрики, время, память |
+ | `results/<backend>/logs/` | кривые сходимости: train loss и норма градиента каждые 50 шагов, val F1 каждые 100 |
+diff --git a/TODO.md b/TODO.md
+index 44705a1..4fc5163 100644
+--- a/TODO.md
++++ b/TODO.md
+@@ -62,16 +62,18 @@
+ - [~] Карта источников случайности для отчёта (раздел `lab4 stoch`, числа подставляются из результатов)
+ - [x] Сценарии S0-S5 (S5: 100 розыгрышей цепи Маркова) считаются в каждом основном запуске
+ 
+-## Этап 8. Перенос в ВКР: каскад (1,5 дня)
++## Этап 8. Перенос лучшего метода (задание 4)
+ 
+-- [ ] Каскад: точное совпадение -> классификатор (порог τ на val) -> LLM (промпт и вызов из `run_llm_benchmark.py`, нужен PROXY_API_KEY)
+-- [ ] 4 варианта: только LLM / только классификатор / каскад с лучшим / каскад с базовым (SGD или Adam); метрики F1, доля вызовов LLM, ₽, задержка p50/p95 на S0 и S3-S5
+-- [ ] Проверка H4 и критерия переноса. Вероятности классификатора на test сохраняются в `results/<backend>/probs/` (S0, S3, S4, MAIN)
++Каскад с LLM, H4 и критерий переноса по каскаду **вне объёма задания** (решение от 05.11; документы, `configs/` не менялись).
++
++- [~] Сравнение выбранного оптимизатора с SGD и Adam и сопоставление с ЛР1: `uv run lab4 transfer --lab1-f1 0.9640 --lab1-n 255 --lab4-n 216` -> `results/<backend>/transfer/` (проверено на синтетике)
++- [ ] Выполнить на реальных результатах
++- [x] ~~Каскад точное совпадение -> классификатор -> LLM, 4 варианта, H4~~ - вне объёма задания
+ 
+ ## Этап 9. Отчёт (2 дня)
+ 
+ - [ ] .docx в порядке из задания: обзор, карта случайности, паспорт, 8 оптимизаторов, 10 seed, sensitivity, сценарии, перенос, вывод
+-- [ ] Проверка, что все числа берутся из runs.csv
++- [~] Проверка, что все числа берутся из results: `uv run lab4 check-report отчёт.docx --allow 0.9640 255 216` (проверено на синтетике)
+ - [ ] Прогнать текст на признаки ИИ (преподаватель строго относится)
+ 
+ ## Известные ограничения
+diff --git a/src/vkr/lab4/check_report.py b/src/vkr/lab4/check_report.py
+new file mode 100644
+index 0000000..06e4834
+--- /dev/null
++++ b/src/vkr/lab4/check_report.py
+@@ -0,0 +1,135 @@
++"""Проверка чисел отчёта: каждое число в тексте должно находиться в results/<backend>/ (runs.csv, stats, stochastic, tuning, noise, transfer).
++
++Число считается подтверждённым, если округление какого-то значения из результатов до того же числа знаков даёт его (с учётом процентов).
++Помимо отдельных значений в пул входят средние и SD по группам (фаза, оптимизатор) каждой числовой колонки runs.csv.
++Без torch; читает .md, .txt и .docx (без внешних зависимостей).
++"""
++from __future__ import annotations
++
++import json
++import re
++import zipfile
++from pathlib import Path
++
++import numpy as np
++import pandas as pd
++
++NUM = re.compile(r"(?<![\w.,/-])[-+−]?\d+(?:[.,]\d+)?(?:\s?%)?(?![\w])")
++
++
++def read_text(path: Path) -> str:
++    if path.suffix.lower() == ".docx":
++        xml = zipfile.ZipFile(path).read("word/document.xml").decode("utf-8")
++        xml = re.sub(r"</w:p>", "\n", xml)
++        xml = re.sub(r"</w:tc>", " | ", xml)
++        t = re.sub(r"<[^>]+>", "", xml)
++        return (t.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"').replace("&apos;", "'"))
++    return path.read_text(encoding="utf-8-sig")
++
++
++def _flatten(o, acc: list):
++    if isinstance(o, dict):
++        for v in o.values():
++            _flatten(v, acc)
++    elif isinstance(o, list):
++        for v in o:
++            _flatten(v, acc)
++    elif isinstance(o, (int, float)) and not isinstance(o, bool) and np.isfinite(o):
++        acc.append(float(o))
++
++
++def collect_pool(results_dir: Path, extra: list[float] | None = None) -> np.ndarray:
++    vals: list[float] = list(extra or [])
++    for p in sorted(results_dir.rglob("*.csv")):
++        if "probs" in p.parts or "logs" in p.parts:
++            continue
++        try:
++            df = pd.read_csv(p, encoding="utf-8-sig")
++        except Exception:
++            continue
++        num = df.select_dtypes("number")
++        vals += [float(x) for x in num.to_numpy().ravel() if np.isfinite(x)]
++        if p.name in ("runs.csv", "pilot_runs.csv") and {"phase", "optimizer"} <= set(df.columns):
++            for _, g in df.groupby(["phase", "optimizer"]):
++                gn = g.select_dtypes("number")
++                for stat in (gn.mean(), gn.std(ddof=1), gn.min(), gn.max(), gn.median()):
++                    vals += [float(x) for x in stat if np.isfinite(x)]
++            gn = df.select_dtypes("number")
++            vals += [float(x) for x in gn.mean() if np.isfinite(x)]
++    for p in sorted(results_dir.rglob("*.json")):
++        try:
++            _flatten(json.loads(p.read_text(encoding="utf-8")), vals)
++        except Exception:
++            pass
++    return np.unique(np.abs(np.array(vals, dtype=float)))        # знак не сверяется: «падение 0,03» и разность -0,03 это одно число
++
++
++def _strip(text: str) -> str:
++    """Убирает то, что не является результатом: ссылки [12], даты, нумерацию строк и разделов, годы."""
++    t = re.sub(r"\[\d+(?:[,\s–-]+\d+)*\]", " ", text)
++    t = re.sub(r"\b\d{1,2}[./]\d{1,2}[./]\d{2,4}\b", " ", t)
++    t = re.sub(r"(?m)^\s*(?:#+\s*)?\d+(?:\.\d+)*[.)]?\s+", " ", t)
++    t = re.sub(r"\b(?:19|20)\d{2}\b", " ", t)
++    t = re.sub(r"(?i)\b(?:S|H|M|T|ЛР|лаб\.?|табл\.?|рис\.?|раздел\w*|п\.)\s?\d+\b", " ", t)
++    return t
++
++
++def parse(token: str) -> tuple[float, int, bool]:
++    pct = token.rstrip().endswith("%")
++    s = token.replace("%", "").replace("−", "-").replace(" ", "").replace(",", ".")
++    dec = len(s.split(".")[1]) if "." in s else 0
++    return float(s), dec, pct
++
++
++def is_confirmed(v: float, dec: int, pct: bool, pool: np.ndarray) -> bool:
++    """pool: отсортированные абсолютные значения. Совпадение после округления до тех же знаков (для процентов ещё и доля = v/100)."""
++    for x, d in [(abs(v), dec)] + ([(abs(v) / 100, dec + 2)] if pct else []):
++        tol = 0.5 * 10 ** -d + 1e-9
++        i = np.searchsorted(pool, x - tol)
++        if i < len(pool) and pool[i] <= x + tol:
++            return True
++    return False
++
++
++def check_text(text: str, pool: np.ndarray, allow: list[float] | None = None, min_int: int = 21) -> dict:
++    """Возвращает {'ok': [...], 'bad': [...], 'ints': [...]}: bad - десятичные числа без источника, ints - целые без источника."""
++    allow = np.unique(np.abs(np.array(allow or [], dtype=float)))
++    full = np.unique(np.concatenate([pool, allow])) if len(allow) else pool
++    clean = _strip(text)
++    res = {"ok": [], "bad": [], "ints": []}
++    for m in NUM.finditer(clean):
++        tok = m.group(0)
++        v, dec, pct = parse(tok)
++        ctx = clean[max(0, m.start() - 35):m.end() + 25].replace("\n", " ").strip()
++        item = {"число": tok.strip(), "контекст": ctx}
++        if is_confirmed(v, dec, pct, full):
++            res["ok"].append(item)
++        elif dec == 0 and not pct and abs(v) < min_int:
++            continue                                   # маленькие целые (число seed, номера) не проверяем
++        elif dec == 0 and not pct:
++            res["ints"].append(item)
++        else:
++            res["bad"].append(item)
++    return res
++
++
++def run_check(cfg, path: Path, allow: list[float] | None = None, out: Path | None = None) -> tuple[Path, dict]:
++    pool = collect_pool(cfg.results_dir)
++    if len(pool) == 0:
++        raise SystemExit(f"В {cfg.results_dir} нет результатов для сверки.")
++    res = check_text(read_text(path), pool, allow)
++    out = out or cfg.results_dir / "stats" / "check_report.md"
++    out.parent.mkdir(parents=True, exist_ok=True)
++
++    def table(items):
++        return "\n".join(["| число | контекст |", "| --- | --- |"] + [f"| {i['число']} | …{i['контекст']}… |" for i in items]) if items else "нет\n"
++
++    L = [f"# Проверка чисел отчёта: {path.name}\n",
++         f"Подтверждено значениями из results: {len(res['ok'])}. Без источника (десятичные): {len(res['bad'])}. "
++         f"Целые от 21 и выше без источника: {len(res['ints'])}. В пуле {len(pool)} уникальных значений.\n",
++         "## Десятичные числа без источника (исправить или объяснить)\n", table(res["bad"]), "\n",
++         "## Целые числа без источника (проверить вручную)\n", table(res["ints"]), "\n",
++         "Числа ЛР1 (например 0,9640, 255, 216) в results нет: передайте их через `--allow`. Числа внутри ссылок [n], даты, годы и "
++         "нумерация разделов пропускаются.\n"]
++    out.write_text("\n".join(L), encoding="utf-8")
++    return out, res
+diff --git a/src/vkr/lab4/cli.py b/src/vkr/lab4/cli.py
+index 3c15dfc..9d67f00 100644
+--- a/src/vkr/lab4/cli.py
++++ b/src/vkr/lab4/cli.py
+@@ -244,6 +244,25 @@ def cmd_stats(args):
+     print("Отчёт:", build_report(cfg, read_runs(cfg)))
+ 
+ 
++def cmd_transfer(args):
++    from .runner import read_runs
++    from .transfer import build_transfer
++    cfg = _cfg(args)
++    lab1 = {"f1": args.lab1_f1, "n": args.lab1_n, "n4": args.lab4_n, "name": args.lab1_name} if args.lab1_f1 else None
++    print("Отчёт:", build_transfer(cfg, read_runs(cfg), args.final, tuple(args.baselines), lab1))
++
++
++def cmd_check_report(args):
++    from .check_report import run_check
++    cfg = _cfg(args)
++    out, res = run_check(cfg, Path(args.file), args.allow)
++    print(f"Отчёт: {out}. Подтверждено: {len(res['ok'])}, без источника: {len(res['bad'])} десятичных, {len(res['ints'])} целых")
++    for i in res["bad"][:20]:
++        print(f"  ? {i['число']}: …{i['контекст']}…")
++    if res["bad"]:
++        sys.exit(1)
++
++
+ def cmd_status(args):
+     from .runner import read_runs, runs_path
+     cfg = _cfg(args)
+@@ -295,6 +314,16 @@ def main(argv=None):
+     p.add_argument("--only", nargs="*", choices=["sens", "noise", "robust", "map"], help="только эти разделы")
+     p.add_argument("--bootstrap", type=int, default=2000, help="число перевыборок")
+     add("stats", cmd_stats, "этап 6: статистика, сводный балл, гипотезы, графики")
++    p = add("transfer", cmd_transfer, "задание 4: выбранный оптимизатор против SGD/Adam и сопоставление с ЛР1 (из runs.csv)")
++    p.add_argument("--final", help="по умолчанию итоговый выбор из stats")
++    p.add_argument("--baselines", nargs="*", default=["sgd", "adam"])
++    p.add_argument("--lab1-f1", type=float, help="Macro-F1 LLM из ЛР1, например 0.9640")
++    p.add_argument("--lab1-n", type=int, help="строк в тесте ЛР1 (out_hard/test), например 255")
++    p.add_argument("--lab4-n", type=int, help="строк в исходном тесте ЛР4 (out/test), например 216")
++    p.add_argument("--lab1-name", default="qwen/qwen3.8-flash, few-shot k=3")
++    p = add("check-report", cmd_check_report, "проверка: каждое число отчёта (.md/.txt/.docx) есть в results/<backend>/")
++    p.add_argument("file")
++    p.add_argument("--allow", type=float, nargs="*", default=[], help="внешние числа, которых нет в results (например 0.9640 255 216)")
+     add("status", cmd_status, "сколько запусков выполнено")
+     args = ap.parse_args(argv)
+     args.fn(args)
+diff --git a/src/vkr/lab4/report.py b/src/vkr/lab4/report.py
+index 6de2f69..6a27714 100644
+--- a/src/vkr/lab4/report.py
++++ b/src/vkr/lab4/report.py
+@@ -74,7 +74,7 @@ def build_report(cfg, runs: pd.DataFrame) -> Path:
+         w.to_csv(out / "wilcoxon_holm.csv", encoding="utf-8-sig")
+         lines += [f"Парный Wilcoxon {choice['winner']} против остальных (по seed, Holm):\n", S.fmt_table(w.rename_axis("optimizer")), "\n"]
+     lines += ["## Сценарии S0-S5 (средний Macro-F1, ранг, падение к S0)\n", S.fmt_table(scen), "\n",
+-              "## Гипотезы\n"] + [f"- {h['h']}: {h['value']} -> {'подтверждена' if h['ok'] else 'не подтверждена' if h['ok'] is False else 'ожидает этапа 8'}" for h in hyp]
++              "## Гипотезы\n"] + [f"- {h['h']}: {h['value']} -> {'подтверждена' if h['ok'] else 'не подтверждена' if h['ok'] is False else 'не проверяется (вне объёма задания)'}" for h in hyp]
+     unstable = main[main["unstable"].astype(str).isin(["1", "True", "1.0"])]
+     keep = [c for c in ("run_id", "optimizer", "seed", "lr", "unstable_reason", "steps_done") if c in unstable.columns]
+     unstable[keep].to_csv(out / "unstable_main.csv", index=False, encoding="utf-8-sig")   # полный журнал всех фаз: results/<backend>/unstable_runs.csv
+diff --git a/src/vkr/lab4/stats.py b/src/vkr/lab4/stats.py
+index eadaa62..e7ab06b 100644
+--- a/src/vkr/lab4/stats.py
++++ b/src/vkr/lab4/stats.py
+@@ -144,7 +144,7 @@ def hypotheses(summary: pd.DataFrame, scen: pd.DataFrame, winner: str | None, hy
+     if winner is not None:
+         ranks = {s: int(scen.loc[winner, f"rank_{s}"]) for s in ("S3", "S4", "S5") if f"rank_{s}" in scen.columns}
+         out.append({"h": "H3", "value": f"ранги {winner}: {ranks}", "ok": bool(ranks) and all(r <= 3 for r in ranks.values())})
+-    out.append({"h": "H4", "value": "проверяется на этапе 8 (каскад с LLM), см. TODO.md", "ok": None})
++    out.append({"h": "H4", "value": "вне объёма задания ЛР4 (каскад с LLM не выполняется); перенос: `lab4 transfer`", "ok": None})
+     return out
+ 
+ 
+diff --git a/src/vkr/lab4/transfer.py b/src/vkr/lab4/transfer.py
+new file mode 100644
+index 0000000..949cedd
+--- /dev/null
++++ b/src/vkr/lab4/transfer.py
+@@ -0,0 +1,96 @@
++"""Задание 4: «перенос лучшего метода». Сравнение выбранного оптимизатора с базовыми (SGD, Adam) в модели ЛР4 и сопоставление с ЛР1.
++
++Без torch, только runs.csv. Каскад с LLM в объём задания не входит. Числа ЛР1 пользователь задаёт сам и они явно помечены
++как несопоставимые напрямую (другая модель и другой тестовый набор).
++"""
++from __future__ import annotations
++
++from pathlib import Path
++
++import numpy as np
++import pandas as pd
++from scipy import stats as sst
++
++from . import stats as S
++
++METRICS = [("test_f1_S0", "F1 S0 (исходные заголовки)"), ("test_f1_main", "F1 MAIN (мутации)"),
++           ("test_ece_main", "ECE MAIN"), ("steps_to_target", "шагов до цели (усечено бюджетом)")]
++
++
++def _col(main: pd.DataFrame, o: str, c: str, budget: int) -> pd.Series:
++    g = main[main["optimizer"] == o].set_index(pd.to_numeric(main[main["optimizer"] == o]["seed"]))
++    x = pd.to_numeric(g[c], errors="coerce")
++    return x.fillna(budget) if c == "steps_to_target" else x
++
++
++def paired(main: pd.DataFrame, a: str, b: str, col: str, budget: int, n_boot: int) -> dict:
++    """Разность a - b по общим seed: среднее, bootstrap-ДИ по seed, точный парный Wilcoxon (при n=5 минимум p = 0,0625)."""
++    d = (_col(main, a, col, budget) - _col(main, b, col, budget)).dropna()
++    m, lo, hi = S.bootstrap_ci(d.to_numpy(), n_boot)
++    p = 1.0 if len(d) == 0 or np.allclose(d, 0) else float(sst.wilcoxon(d, zero_method="wilcox", method="auto").pvalue)
++    return {"n_seeds": int(len(d)), "diff": m, "ci_lo": lo, "ci_hi": hi, "p_wilcoxon": p,
++            "min_possible_p": float(2 / 2 ** len(d)) if len(d) else float("nan")}
++
++
++def build_transfer(cfg, runs: pd.DataFrame, final: str | None = None, baselines=("sgd", "adam"), lab1: dict | None = None,
++                   out: Path | None = None) -> Path:
++    out = out or cfg.results_dir / "transfer"
++    out.mkdir(parents=True, exist_ok=True)
++    main = runs[runs["phase"] == "main"]
++    if main.empty:
++        raise SystemExit("Нет запусков main.")
++    sel, budget = cfg.protocol["selection"], cfg.protocol["train"]["steps"]
++    summary = S.summarize(main, sel, budget)
++    score = S.composite(summary, sel["weights"])
++    choice = S.choose_winner(summary, score, sel["max_unstable_share"])
++    final = final or choice["final"]
++    if final not in summary.index:
++        raise SystemExit(f"Оптимизатор {final} не найден в main.")
++    scen_cols = {"test_f1_S0": "F1 S0", "test_f1_S3": "F1 S3", "test_f1_S4": "F1 S4", "test_f1_main": "F1 MAIN", "test_f1_S5": "F1 S5"}
++    rows = []
++    for o in [final] + [b for b in baselines if b != final and b in summary.index]:
++        r = {"optimizer": o, "роль": "выбранный" if o == final else "базовый"}
++        for c, name in scen_cols.items():
++            if c in main.columns:
++                m, lo, hi = S.bootstrap_ci(pd.to_numeric(main[main.optimizer == o][c], errors="coerce").dropna(), sel["bootstrap_resamples"])
++                r[name] = m
++                if c in ("test_f1_S0", "test_f1_main"):
++                    r[name + " ДИ"] = f"[{lo:.3f}; {hi:.3f}]"
++        s = summary.loc[o]
++        r.update({"ECE MAIN": s["ece_mean"], "val F1": s["val_f1_mean"], "шагов до цели": s["steps_to_target_mean"],
++                  "достигла цели": f"{int(s['reached_target'])} из {int(s['n_runs'])}", "время, мин": s["train_time_min"],
++                  "память, МБ": s["peak_mem_mb"], "нестабильных": s["unstable_share"]})
++        rows.append(r)
++    tbl = pd.DataFrame(rows).set_index("optimizer")
++    tbl.to_csv(out / "transfer_table.csv", encoding="utf-8-sig")
++    pr = []
++    for b in baselines:
++        if b == final or b not in summary.index:
++            continue
++        for col, name in METRICS:
++            if col in main.columns:
++                pr.append({"против": b, "метрика": name, **paired(main, final, b, col, budget, sel["bootstrap_resamples"])})
++    pairs = pd.DataFrame(pr)
++    pairs.to_csv(out / "transfer_pairs.csv", index=False, encoding="utf-8-sig")
++    L = ["# Перенос лучшего метода (авто-отчёт из runs.csv)\n",
++         f"Выбранный оптимизатор (правило раздела 6 PROTOCOL.md): **{final}**; вердикт выбора: {choice['verdict']}. Базовые: {', '.join(b for b in baselines if b != final)}.\n",
++         "## Сводка\n", S.fmt_table(tbl), "\n",
++         "## Парные разности (выбранный минус базовый, по общим seed)\n",
++         "Для steps_to_target и ECE меньше значит лучше. p_wilcoxon при n seed не может быть меньше min_possible_p: при 5 seed это 0,0625, "
++         "значимости 0,05 не достичь в принципе, поэтому вывод строится по размеру эффекта и ДИ, а формулировать надо «различие не подтверждено», "
++         "а не «различия нет».\n", S.fmt_table(pairs.set_index(["против", "метрика"])) if len(pairs) else "нет базовых оптимизаторов\n", "\n"]
++    L += ["## Сопоставление с ЛР1\n"]
++    if lab1:
++        f4 = float(summary.loc[final, "f1_mean"])
++        L += [f"| Показатель | Значение | Тестовый набор | Модель |", "| --- | --- | --- | --- |",
++              f"| ЛР1: {lab1.get('name', 'LLM')} | {lab1['f1']:.4f} | {lab1.get('test', 'out_hard/test')}"
++              + (f", {lab1['n']} строк" if lab1.get("n") else "") + " | LLM, few-shot |",
++              f"| ЛР4: {final}, F1 MAIN | {f4:.4f} | out/test с мутациями" + (f", {lab1['n4']} строк (исходных)" if lab1.get("n4") else "")
++              + " | Qwen3-0.6B + LoRA |", "",
++              "**Напрямую числа не сравнимы:** разные модели и разные тестовые наборы (out_hard/test в ЛР1 против out/test в ЛР4), "
++              "в ЛР4 добавлены искусственные мутации заголовков. Сопоставление показывает порядок величины и положение метода относительно "
++              "результата ЛР1, но не доказывает превосходства одного подхода.\n"]
++    else:
++        L.append("Числа ЛР1 не заданы (`--lab1-f1 0.9640 --lab1-n 255 --lab4-n 216`).\n")
++    (out / "transfer.md").write_text("\n".join(L), encoding="utf-8")
++    return out / "transfer.md"
+diff --git a/tests/test_transfer_check.py b/tests/test_transfer_check.py
+new file mode 100644
+index 0000000..74b688e
+--- /dev/null
++++ b/tests/test_transfer_check.py
+@@ -0,0 +1,60 @@
++"""Задание 4 и проверка чисел отчёта (без torch)."""
++import zipfile
++
++import numpy as np
++import pandas as pd
++import pytest
++
++from vkr.lab4 import check_report as C
++from vkr.lab4.runner import FIELDS
++from vkr.lab4.transfer import build_transfer, paired
++
++
++def _runs(cfg):
++    rng = np.random.default_rng(0)
++    rows = []
++    base = {"adagrad": 0.78, "rmsprop": 0.78, "sgd": 0.73, "adam": 0.76}
++    for o, b in base.items():
++        for s in range(5):
++            rows.append({"run_id": f"main-{o}-{s}", "phase": "main", "optimizer": o, "lr": 0.01, "seed": s, "batch_size": 64,
++                         "steps_to_target": 20 + (30 if o == "sgd" else 0) + s, "unstable": 0, "val_f1_final": 0.93,
++                         "test_f1_S0": 0.99, "test_f1_S3": b + 0.02, "test_f1_S4": 0.9, "test_f1_S5": 0.91, "test_f1_main": b + rng.normal(0, 0.02),
++                         "test_ece_main": 0.07, "train_time_s": 75.0, "peak_mem_mb": 4372.2})
++    return pd.DataFrame(rows, columns=FIELDS)
++
++
++def test_paired_diff_and_minimum_p(cfg):
++    runs = _runs(cfg)
++    r = paired(runs, "adagrad", "sgd", "test_f1_main", 80, 500)
++    assert r["n_seeds"] == 5 and r["diff"] > 0.03 and r["min_possible_p"] == pytest.approx(0.0625)
++    assert r["p_wilcoxon"] >= 0.0625 - 1e-12                       # при n=5 значимости нет в принципе
++
++
++def test_transfer_report(cfg, tmp_path):
++    p = build_transfer(cfg, _runs(cfg), final="adagrad", lab1={"f1": 0.964, "n": 255, "n4": 216, "name": "LLM"}, out=tmp_path)
++    t = p.read_text(encoding="utf-8")
++    assert "adagrad" in t and "напрямую числа не сравнимы" in t.lower() and "0.9640" in t
++    pairs = pd.read_csv(tmp_path / "transfer_pairs.csv", encoding="utf-8-sig")
++    assert set(pairs["против"]) == {"sgd", "adam"}
++
++
++def test_checker_confirms_and_flags(cfg, tmp_path):
++    res = tmp_path / "res"
++    (res / "stats").mkdir(parents=True)
++    pd.DataFrame({"optimizer": ["a", "b"], "f1_mean": [0.77512, 0.7371], "steps": [28, 54], "diff": [-0.0527, 0.0]}).to_csv(res / "stats" / "summary.csv")
++    pool = C.collect_pool(res)
++    text = ("RMSprop дал F1 0,775, SGD 0,737 [12]. Разрыв 0,0527 (5,27 %). Шагов 28 и 54 в 2026 году. Выдуманное число 0,801. "
++            "Ещё 1234 запуска. 1. Раздел S3, H2.")
++    r = C.check_text(text, pool)
++    bad = [i["число"] for i in r["bad"]]
++    assert bad == ["0,801"]
++    assert any(i["число"].startswith("5,27") for i in r["ok"]) and any(i["число"] == "0,775" for i in r["ok"])
++    assert [i["число"] for i in r["ints"]] == ["1234"]
++    assert not C.check_text("ЛР1: 0,9640 и 255 строк", pool, allow=[0.9640, 255])["bad"]
++
++
++def test_docx_text_is_read(tmp_path):
++    p = tmp_path / "r.docx"
++    with zipfile.ZipFile(p, "w") as z:
++        z.writestr("word/document.xml", '<w:document><w:body><w:p><w:r><w:t>F1 равен 0,775</w:t></w:r></w:p></w:body></w:document>')
++    assert "0,775" in C.read_text(p)

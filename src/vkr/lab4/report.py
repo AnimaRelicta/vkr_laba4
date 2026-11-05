@@ -74,7 +74,7 @@ def build_report(cfg, runs: pd.DataFrame) -> Path:
         w.to_csv(out / "wilcoxon_holm.csv", encoding="utf-8-sig")
         lines += [f"Парный Wilcoxon {choice['winner']} против остальных (по seed, Holm):\n", S.fmt_table(w.rename_axis("optimizer")), "\n"]
     lines += ["## Сценарии S0-S5 (средний Macro-F1, ранг, падение к S0)\n", S.fmt_table(scen), "\n",
-              "## Гипотезы\n"] + [f"- {h['h']}: {h['value']} -> {'подтверждена' if h['ok'] else 'не подтверждена' if h['ok'] is False else 'ожидает этапа 8'}" for h in hyp]
+              "## Гипотезы\n"] + [f"- {h['h']}: {h['value']} -> {'подтверждена' if h['ok'] else 'не подтверждена' if h['ok'] is False else 'не проверяется (вне объёма задания)'}" for h in hyp]
     unstable = main[main["unstable"].astype(str).isin(["1", "True", "1.0"])]
     keep = [c for c in ("run_id", "optimizer", "seed", "lr", "unstable_reason", "steps_done") if c in unstable.columns]
     unstable[keep].to_csv(out / "unstable_main.csv", index=False, encoding="utf-8-sig")   # полный журнал всех фаз: results/<backend>/unstable_runs.csv
